@@ -1,0 +1,97 @@
+{
+  "manifest_version": "0.2",
+  "name": "garmin-coach",
+  "display_name": "Garmin Morning Coach",
+  "version": "1.7.0",
+  "description": "Pulls Garmin data and provides daily readiness, training load, fitness trend, and recent activity coaching",
+  "author": { "name": "You" },
+  "server": {
+    "type": "python",
+    "entry_point": "server/main.py",
+    "mcp_config": {
+      "command": "/bin/bash",
+      "args": ["${__dirname}/start.sh"],
+      "env": {
+        "GARMIN_EMAIL": "${user_config.garmin_email}",
+        "GARMIN_PASSWORD": "${user_config.garmin_password}"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "calibrate",
+      "description": "Compute personal HRV and resting HR baselines from the last 30 days of Garmin data. Runs automatically on first use and silently every 7 days. Call manually after a significant fitness change."
+    },
+    {
+      "name": "get_morning_metrics",
+      "description": "Fetch overnight Garmin metrics (HRV, resting HR, sleep, body battery, stress) and return a daily readiness decision: GREEN / AMBER / RED"
+    },
+    {
+      "name": "get_training_load",
+      "description": "Fetch training status and compute ACWR (acute:chronic workload ratio) from the last 28 days of activities to assess overreach and injury risk"
+    },
+    {
+      "name": "get_fitness_trend",
+      "description": "Fetch VO2 Max values sampled weekly over the past 6 weeks to assess whether fitness is trending up, stable, or declining"
+    },
+    {
+      "name": "get_recent_activities",
+      "description": "Fetch the last 7 days of activities with distance, pace, average HR, and aerobic/anaerobic training effect scores"
+    },
+    {
+      "name": "analyze_run",
+      "description": "Fetch detailed running dynamics and form analysis for a specific activity. Returns cadence, stride length, ground contact time, ground contact balance, vertical oscillation, vertical ratio, running power, per-km splits, and HR zone breakdown with actionable form recommendations. If no activity_id is provided, analyses the most recent running activity."
+    },
+    {
+      "name": "create_running_workout",
+      "description": "Create a structured running workout on Garmin Connect. Supports warmup, easy, interval (time or distance), recovery, cooldown, and repeat blocks. Returns the new workout_id which can be used with schedule_workout."
+    },
+    {
+      "name": "create_strength_workout",
+      "description": "Create a strength/gym workout on Garmin Connect. Each exercise becomes a set of timed work+rest steps on the watch. Returns the new workout_id which can be used with schedule_workout."
+    },
+    {
+      "name": "schedule_workout",
+      "description": "Schedule an existing Garmin workout to a specific calendar date. Use after create_running_workout or create_strength_workout to assign it to a day."
+    },
+    {
+      "name": "get_weekly_review",
+      "description": "Review this week's training vs last week. Compares distance, time, sessions, best session, and ACWR. Ends with a coming-week recommendation based on load."
+    },
+    {
+      "name": "get_monthly_review",
+      "description": "Review this calendar month's training vs last month. Covers volume, consistency, longest run, VO2 Max movement, and a focus area for next month."
+    },
+    {
+      "name": "get_run_window",
+      "description": "Check today's weather and recommend the best time window to run. Auto-detects current location via IP, or accepts an optional location name (e.g. 'Mallusk', 'Belfast'). Weekdays: morning and lunch slots. Weekends: all daylight windows. Scored on precipitation, temperature, wind, and UV."
+    },
+    {
+      "name": "setup_training_plan",
+      "description": "Set up or update the overarching half-marathon training plan. Call with no arguments to fetch Garmin race predictions and get a questionnaire. Call with race_date and training_days_per_week (minimum) to create the plan. Once set, all daily coaching tools automatically include plan context."
+    },
+    {
+      "name": "get_plan_status",
+      "description": "Show full training plan status: race details, current week and phase, predicted vs target time, weekly structure, and phase breakdown. Returns setup instructions if no plan exists."
+    },
+    {
+      "name": "clear_training_plan",
+      "description": "Delete the current training plan. Requires confirmation=true. Use when starting a new training cycle."
+    }
+  ],
+  "user_config": {
+    "garmin_email": {
+      "type": "string",
+      "title": "Garmin Email",
+      "description": "Your Garmin Connect email address",
+      "required": true
+    },
+    "garmin_password": {
+      "type": "string",
+      "title": "Garmin Password",
+      "description": "Your Garmin Connect password",
+      "sensitive": true,
+      "required": true
+    }
+  }
+}
