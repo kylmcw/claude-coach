@@ -288,8 +288,10 @@ def _planned_row_for_date(conn: sqlite3.Connection, date_str: str, sport: str | 
         ).fetchone()
     if row is None:
         return None
-    cols = [d[0] for d in conn.execute("PRAGMA table_info(workouts)").fetchall()]
-    return dict(zip(cols, row))
+    # PRAGMA table_info columns are (cid, name, ...) — name is index 1, not 0.
+    # Index row positionally so this works whether or not row_factory is sqlite3.Row.
+    cols = [c[1] for c in conn.execute("PRAGMA table_info(workouts)").fetchall()]
+    return {col: row[i] for i, col in enumerate(cols)}
 
 
 def _reconcile_activity(conn: sqlite3.Connection, act: dict) -> str | None:
