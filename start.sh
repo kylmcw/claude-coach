@@ -1,18 +1,19 @@
 #!/bin/bash
 # Self-healing startup script for garmin-coach MCP server.
-# Works even if the venv's python3.14 symlink is broken (e.g. after a Homebrew update).
+# Works even if the venv's python3.14 symlink is broken (e.g. after a Homebrew update),
+# or if the venv exists but is missing packages (e.g. first run from a fresh mcpb extract).
 set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV="$DIR/.venv"
 PYTHON="$VENV/bin/python3"
 
-# Fast path: venv python works fine
-if "$PYTHON" -c "import sys" 2>/dev/null; then
+# Fast path: venv python works AND required packages are installed
+if "$PYTHON" -c "import mcp, garminconnect" 2>/dev/null; then
     exec "$PYTHON" "$DIR/server/main.py"
 fi
 
-# Venv python is broken — find python3.14 from common Homebrew locations or PATH
+# Venv missing, broken, or packages not installed — find python3.14
 SYSTEM_PY=""
 for candidate in \
     /opt/homebrew/opt/python@3.14/bin/python3.14 \
@@ -35,13 +36,9 @@ if [ -z "$SYSTEM_PY" ]; then
     exit 1
 fi
 
-echo "garmin-coach: relinking venv to $SYSTEM_PY" >&2
+echo "garmin-coach: rebuilding venv with $SYSTEM_PY" >&2
 
-# --upgrade repoints the interpreter without wiping installed packages.
-# If that fails (major version mismatch), fall back to a clean rebuild.
-if ! "$SYSTEM_PY" -m venv "$VENV" --upgrade 2>/dev/null; then
-    "$SYSTEM_PY" -m venv "$VENV" --clear
-    "$VENV/bin/pip" install -q garminconnect mcp
-fi
+"$SYSTEM_PY" -m venv "$VENV" --clear
+"$VENV/bin/pip" install -q garminconnect mcp
 
 exec "$VENV/bin/python3" "$DIR/server/main.py"
