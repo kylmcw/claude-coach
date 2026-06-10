@@ -1,5 +1,12 @@
 # Garmin Morning Coach — Changelog
 
+## 1.18.1 (2026-06-10) — Backfill review fixes
+
+### Fixed
+- `log_workout_to_history` no longer creates orphan feedback rows (`workout_id=0`) when an activity collides with an existing `(date, type)` row. It now detects the ignored `INSERT OR IGNORE` via `cursor.rowcount`, resolves the existing row id, and only writes feedback against a real row. Surfaced by `backfill_runs` (e.g. two runs the same day).
+- `fetch_recent_activities(days)` now pages through the activity feed until it passes the cutoff, so long backfill windows (up to 90 days) aren't truncated by a single fixed-size fetch. Short windows still resolve in one API call.
+- `backfill_runs` reconciles each activity under its own try/except, so one malformed activity no longer aborts the whole backfill.
+
 ## 1.18.0 (2026-06-10) — Run backfill, profile-file fix, LTHR cleanup
 
 ### New: `backfill_runs`

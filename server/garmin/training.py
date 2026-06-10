@@ -256,9 +256,27 @@ def _scan_niggle_patterns(limit: int = 60) -> list[str]:
 def fetch_recent_activities(days: int = 7) -> list[dict]:
     """Last `days` days of activities with key running metrics."""
     client  = get_client()
-    acts    = client.get_activities(0, max(15, days * 2))
     cutoff  = date.today() - timedelta(days=days)
     recent  = []
+
+    # Page through the feed until we pass the cutoff, so long windows (e.g. backfill_runs
+    # over 90 days) aren't truncated by a single fixed-size fetch. For the common short
+    # window the first page already crosses the cutoff, so this stays one API call.
+    acts: list = []
+    start, batch = 0, max(20, days * 2)
+    while start < 1000:
+        page = client.get_activities(start, batch)
+        if not page:
+            break
+        acts.extend(page)
+        oldest = page[-1].get("startTimeLocal", "")[:10]
+        try:
+            oldest_date = date.fromisoformat(oldest)
+        except ValueError:
+            break
+        if oldest_date < cutoff or len(page) < batch:
+            break
+        start += batch
 
     for act in acts:
         act_date_str = act.get("startTimeLocal", "")[:10]

@@ -184,7 +184,7 @@ def log_workout_to_history(
             week_number   = min(weeks_elapsed + 1, plan["total_weeks"])
             phase         = get_plan_phase(week_number, plan["total_weeks"])
 
-        conn.execute(
+        cur = conn.execute(
             """INSERT OR IGNORE INTO workouts
                    (cycle_id, date, activity_id, garmin_workout_id, type, phase,
                     week_number, planned_distance_km, actual_distance_km,
@@ -203,9 +203,19 @@ def log_workout_to_history(
              elevation_gain_m, avg_respiration_rate),
         )
         conn.commit()
-        workout_row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-        if any(v is not None for v in [rpe, feel, niggles, notes]):
+        if cur.rowcount:
+            workout_row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        else:
+            # (date, type) already existed — INSERT OR IGNORE was a no-op. Resolve the
+            # existing row so feedback never attaches to a phantom workout_id=0.
+            row = conn.execute(
+                "SELECT id FROM workouts WHERE date = ? AND type = ?",
+                (date_str, workout_type),
+            ).fetchone()
+            workout_row_id = row[0] if row else 0
+
+        if workout_row_id and any(v is not None for v in [rpe, feel, niggles, notes]):
             conn.execute(
                 """INSERT INTO feedback (workout_id, date, rpe, feel, niggles, notes)
                    VALUES (?, ?, ?, ?, ?, ?)""",
@@ -423,9 +433,12 @@ def backfill_runs(days: int = 14) -> list[str]:
         conn.row_factory = sqlite3.Row
         try:
             for act in sorted(recent, key=lambda a: a["date"]):
-                msg = _reconcile_activity(conn, act)
-                if msg:
-                    logged.append(msg)
+                try:
+                    msg = _reconcile_activity(conn, act)
+                    if msg:
+                        logged.append(msg)
+                except Exception as e:
+                    logged.append(f"Skipped {act.get('name', 'activity')} ({act.get('date', '?')}): {e}")
         finally:
             conn.close()
 
