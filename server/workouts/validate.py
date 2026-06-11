@@ -19,7 +19,11 @@ import sys
 from datetime import date
 from pathlib import Path
 
-_profile  = os.environ.get("GARMIN_COACH_PROFILE", "")
+_profile  = os.environ.get("GARMIN_COACH_PROFILE", "").strip()
+# Standalone hook (can't import server/utils): inline the same guard as get_profile_suffix —
+# an optional manifest field left blank can arrive as the literal '${user_config.profile_name}'.
+if _profile.startswith("${"):
+    _profile = ""
 _suffix   = f"-{_profile}" if _profile else ""
 PLAN_FILE = Path.home() / f".garmin-coach{_suffix}-plan.json"
 

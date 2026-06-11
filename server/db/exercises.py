@@ -221,10 +221,13 @@ def register_exercise_alias(
 
 def _round_weight(weight_kg: float, increasing: bool) -> float:
     """Round to nearest 2.5 kg plate increment."""
+    # Absorb float error (e.g. 100 * 1.1 == 110.00000000000001) before snapping to a plate,
+    # otherwise a value already on a 2.5 boundary gets bumped an extra increment (110 -> 112.5).
+    units = round(weight_kg / 2.5, 6)
     if increasing:
-        return math.ceil(weight_kg / 2.5) * 2.5
+        return math.ceil(units) * 2.5
     else:
-        return math.floor(weight_kg / 2.5) * 2.5
+        return math.floor(units) * 2.5
 
 
 def set_exercise_defaults(exercises: list[dict]) -> list[str]:
