@@ -1,5 +1,14 @@
 # Garmin Morning Coach — Changelog
 
+## 1.18.2 (2026-06-11) — Bugs caught by the new unit-test suite
+
+Added an isolated unit-test suite (`tests/`, pytest, 228 tests, no network/creds) across all domain folders. Writing it surfaced three production bugs, now fixed:
+
+### Fixed
+- **Planned-workout reconciliation was silently broken.** `_planned_row_for_date` built its result dict from `[d[0] for d in PRAGMA table_info(...)]`, but `d[0]` is the column index (`cid`), not the name — so with `row_factory=sqlite3.Row` (used by auto-log and backfill) it returned an integer-keyed dict and `planned["id"]` raised `KeyError`. Planned runs were never marked complete (the error was swallowed). Now indexes the row against real column names.
+- **Strength progression over-jumped at plate boundaries.** `_round_weight` ceilinged on a float-error value (`100 * 1.1 == 110.00000000000001`), bumping a clean +10% to an extra plate (110 → 112.5). Rounds to 6dp before snapping to 2.5 kg.
+- **Workout guard could silently disable itself.** The `validate.py` PreToolUse hook still used the pre-centralization profile suffix and could resolve `PLAN_FILE` to a literal `${...}` path → `load_plan()` returns None → validation skipped. Applied the same blank/placeholder guard inline.
+
 ## 1.18.1 (2026-06-10) — Backfill review fixes
 
 ### Fixed
