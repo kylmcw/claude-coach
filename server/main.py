@@ -41,9 +41,8 @@ RHR_NORM_DEFAULT = 60
 # ConditionType enum has the WRONG numbers (it defines DISTANCE=1), which
 # silently turns distance laps into "press lap button" steps (id 1 = lap.button).
 # These constants are Garmin's real values; use them instead of the library enum.
-COND_LAP_BUTTON = 1
-COND_TIME       = 2
-COND_DISTANCE   = 3
+COND_TIME     = 2
+COND_DISTANCE = 3
 
 # ─── Calibration config ───────────────────────────────────────────────────────
 CALIBRATION_FILE        = Path.home() / ".garmin-coach.json"
