@@ -23,7 +23,7 @@ Do NOT consider a change complete until the mcpb is rebuilt and the version is b
 
 ## Current Version
 
-`1.7.0` — last updated in `manifest.json`.
+`1.7.1` — last updated in `manifest.json`.
 
 ## Project Structure
 
