@@ -35,6 +35,15 @@ HRV_LOW_DEFAULT  = 50
 HRV_HIGH_DEFAULT = 70
 RHR_NORM_DEFAULT = 60
 
+# ─── Garmin workout end-condition IDs ──────────────────────────────────────────
+# Garmin keys workout steps off the numeric conditionTypeId, NOT the string key —
+# if the id and key disagree, the id wins. The garminconnect library's
+# ConditionType enum has the WRONG numbers (it defines DISTANCE=1), which
+# silently turns distance laps into "press lap button" steps (id 1 = lap.button).
+# These constants are Garmin's real values; use them instead of the library enum.
+COND_TIME     = 2
+COND_DISTANCE = 3
+
 # ─── Calibration config ───────────────────────────────────────────────────────
 CALIBRATION_FILE        = Path.home() / ".garmin-coach.json"
 RECALIBRATE_AFTER_DAYS  = 7   # silently recalibrate if baseline is older than this
@@ -1309,8 +1318,11 @@ def build_running_steps(steps: list[dict]) -> list:
 
         elif step_type in ("interval", "easy"):
             if "distance_meters" in step:
+                # NOTE: use COND_DISTANCE (3), NOT ConditionType.DISTANCE — the
+                # library enum says 1, but Garmin id 1 is lap.button, which makes
+                # the lap show up as "press lap button" instead of a distance lap.
                 end_condition = {
-                    "conditionTypeId": ConditionType.DISTANCE,
+                    "conditionTypeId": COND_DISTANCE,
                     "conditionTypeKey": "distance",
                     "displayOrder": 1,
                     "displayable": True,
@@ -1318,7 +1330,7 @@ def build_running_steps(steps: list[dict]) -> list:
                 end_value = float(step["distance_meters"])
             else:
                 end_condition = {
-                    "conditionTypeId": ConditionType.TIME,
+                    "conditionTypeId": COND_TIME,
                     "conditionTypeKey": "time",
                     "displayOrder": 2,
                     "displayable": True,

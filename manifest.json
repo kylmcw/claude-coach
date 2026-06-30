@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "garmin-coach",
   "display_name": "Garmin Morning Coach",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Pulls Garmin data and provides daily readiness, training load, fitness trend, and recent activity coaching",
   "author": { "name": "You" },
   "server": {
