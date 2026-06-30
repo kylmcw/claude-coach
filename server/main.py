@@ -1333,7 +1333,7 @@ def build_running_steps(steps: list[dict]) -> list:
                 end_condition = {
                     "conditionTypeId": COND_TIME,
                     "conditionTypeKey": "time",
-                    "displayOrder": 1,
+                    "displayOrder": 2,
                     "displayable": True,
                 }
                 end_value = float(step["duration_minutes"]) * 60
