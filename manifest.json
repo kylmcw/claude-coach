@@ -2,18 +2,23 @@
   "manifest_version": "0.2",
   "name": "garmin-coach",
   "display_name": "Garmin Morning Coach",
-  "version": "1.7.1",
+  "version": "1.23.2",
   "description": "Pulls Garmin data and provides daily readiness, training load, fitness trend, and recent activity coaching",
-  "author": { "name": "You" },
+  "author": {
+    "name": "You"
+  },
   "server": {
     "type": "python",
     "entry_point": "server/main.py",
     "mcp_config": {
       "command": "/bin/bash",
-      "args": ["${__dirname}/start.sh"],
+      "args": [
+        "${__dirname}/start.sh"
+      ],
       "env": {
         "GARMIN_EMAIL": "${user_config.garmin_email}",
-        "GARMIN_PASSWORD": "${user_config.garmin_password}"
+        "GARMIN_PASSWORD": "${user_config.garmin_password}",
+        "GARMIN_COACH_PROFILE": "${user_config.profile_name}"
       }
     }
   },
@@ -48,11 +53,19 @@
     },
     {
       "name": "create_strength_workout",
-      "description": "Create a strength/gym workout on Garmin Connect. Each exercise becomes a set of timed work+rest steps on the watch. Returns the new workout_id which can be used with schedule_workout."
+      "description": "Create a strength/gym workout on Garmin Connect. Exercises can be rep-based (reps) or time-based (duration_seconds) for holds, planks, carries, etc. Each exercise becomes a set of work+rest steps on the watch. Returns the new workout_id which can be used with schedule_workout."
     },
     {
       "name": "schedule_workout",
       "description": "Schedule an existing Garmin workout to a specific calendar date. Use after create_running_workout or create_strength_workout to assign it to a day."
+    },
+    {
+      "name": "get_scheduled_workout",
+      "description": "Read the workout(s) scheduled on the Garmin Connect calendar for a given date (defaults to tomorrow). Returns the workout name, sport type, and the full step/exercise structure with paces/HR zones/durations/distances/sets/reps. Returns 'No workout scheduled for <date>' if nothing is scheduled."
+    },
+    {
+      "name": "get_future_schedule",
+      "description": "Fetch scheduled workouts for the next N days (default 7, max 90) starting from today. Returns a day-by-day list of what is already on the Garmin Connect calendar, including manually rescheduled workouts. Use for planning context before creating new workouts."
     },
     {
       "name": "get_weekly_review",
@@ -77,6 +90,86 @@
     {
       "name": "clear_training_plan",
       "description": "Delete the current training plan. Requires confirmation=true. Use when starting a new training cycle."
+    },
+    {
+      "name": "delete_workout",
+      "description": "Permanently delete a workout from the Garmin Connect workout library. This removes the template entirely and cannot be undone. To just remove from calendar, use unschedule_workout instead."
+    },
+    {
+      "name": "unschedule_workout",
+      "description": "Remove a scheduled workout from the Garmin Connect calendar without deleting the workout template. The workout stays in the library and can be rescheduled later. Requires the scheduled_workout_id (calendar entry ID), not the workout template ID."
+    },
+    {
+      "name": "log_workout_feedback",
+      "description": "Log a completed workout and post-run feedback (RPE, feel, niggles, notes) to the coaching history database. Links automatically to the current training cycle. Use after every session to build longitudinal coaching context."
+    },
+    {
+      "name": "get_workout_history",
+      "description": "Retrieve logged workout history with feedback from the coaching database, ordered by date. The running coach uses this to identify fatigue patterns, load trends, and recurring niggles across weeks or entire training cycles."
+    },
+    {
+      "name": "get_pending_suggestions",
+      "description": "Return all pending coaching suggestions that have not yet been approved or denied. Suggestions are generated automatically during the weekly review based on ACWR, volume trends, and session consistency. Each suggestion has an id, recommendation, rationale, and action_type. Use approve_suggestion to act on them."
+    },
+    {
+      "name": "approve_suggestion",
+      "description": "Approve or deny a pending coaching suggestion by its id. Approved suggestions are logged as accepted coaching decisions. Denied suggestions are dismissed. Both outcomes are recorded for future review."
+    },
+    {
+      "name": "get_daily_briefing",
+      "description": "Single-call morning briefing: readiness (HRV, sleep stages, Training Readiness score \u2192 GREEN/AMBER/RED), today's Garmin scheduled session, best weather window, and a unified go/modify/rest verdict. When AMBER/RED meets a quality session, proposes a swap and logs a coaching suggestion. Accepts optional location for weather."
+    },
+    {
+      "name": "get_recovery_trend",
+      "description": "14-day (configurable) day-by-day trend of HRV, resting HR, sleep score, body battery, and stress with slope-based direction and overreaching/illness flags."
+    },
+    {
+      "name": "generate_week",
+      "description": "Generate and schedule a full week of training sessions on Garmin Connect based on plan phase, ACWR, blocked days, and personalized pace/HR targets from your lactate threshold. Automatically marks the week as planned so the morning coach skips creation. Requires an active training plan."
+    },
+    {
+      "name": "mark_week_planned",
+      "description": "Mark a week as fully planned in the DB so the Monday morning coach skips workout creation. Called automatically by generate_week. Also call manually after setting up a custom or deload week."
+    },
+    {
+      "name": "get_week_planned",
+      "description": "Check whether a week has been marked as planned. Returns planned (bool), week_start, planned_at, and planned_by. Defaults to this week if no date given."
+    },
+    {
+      "name": "get_race_strategy",
+      "description": "Race-day pacing strategy: goal vs Garmin prediction gap analysis, per-km pace bands, half-split targets, taper checklist, and race-day cues. Accepts an optional target_time override."
+    },
+    {
+      "name": "get_fitness_scores",
+      "description": "Fetch Garmin's Endurance Score and Hill Score for today, with descriptive levels."
+    },
+    {
+      "name": "set_exercise_defaults",
+      "description": "Set or update default weights, sets, and reps for strength exercises. Stored in the coaching database and auto-applied when creating strength workouts. Each variation (barbell, dumbbell, incline) is tracked separately."
+    },
+    {
+      "name": "get_exercise_defaults",
+      "description": "View current default weights, sets, and reps for all tracked strength exercises, or filter to a specific exercise name."
+    },
+    {
+      "name": "set_exercise_override",
+      "description": "Temporarily adjust an exercise's programmed weight (percentage or kg, signed) without changing its stored base default \u2014 for a sick/deload/travel week. Optional start_date/end_date window auto-reverts to base afterwards. Newest active override wins; tag with a label to clear a batch."
+    },
+    {
+      "name": "clear_exercise_override",
+      "description": "Remove active exercise weight overrides, reverting to base defaults. Specify one of: name (one exercise), label (a tagged batch), or all=true. Overrides are deactivated, not deleted, so history is preserved."
+    },
+    {
+      "name": "log_strength_progress",
+      "description": "Log per-exercise session outcomes. Completed exercises (all reps hit) get +10% weight suggestion; failed exercises get -10%. Set apply_changes=true to immediately update defaults for the next session."
+    },
+    {
+      "name": "review_strength_workout",
+      "description": "Pull a completed strength activity from Garmin Connect and compare each exercise against stored defaults. Shows logged weight vs default, sets completed vs planned, and flags new exercises. Set apply_defaults=true to save logged weights as new defaults for all fully-completed exercises."
+    },
+    {
+      "name": "get_zones",
+      "description": "Fetch lactate threshold data from Garmin and derive personalised HR and pace zones (easy, aerobic, threshold, interval) using Friel running coefficients. Returns bpm ranges and pace ranges for each zone."
     }
   ],
   "user_config": {
@@ -92,6 +185,12 @@
       "description": "Your Garmin Connect password",
       "sensitive": true,
       "required": true
+    },
+    "profile_name": {
+      "type": "string",
+      "title": "Profile Name",
+      "description": "Unique name for this coaching instance (e.g. 'kayleigh'). Namespaces the local database so multiple users on the same machine stay separate. Leave blank for the default profile.",
+      "required": false
     }
   }
 }

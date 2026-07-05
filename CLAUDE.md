@@ -1,147 +1,148 @@
-# Garmin Morning Coach
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Build & Release
 
-After ANY code change to `server/main.py`, `manifest.json`, `start.sh`, or other project files:
+After ANY code change, before marking done:
 
-1. **Bump the version** in `manifest.json` (patch bump for bug fixes, minor for new features)
-2. **Backup the current mcpb**: `cp garmin-coach.mcpb backups/garmin-coach_pre-<version>-<description>_<date>.mcpb`
-   Then prune old backups, keeping only the 2 most recent:
+1. **Bump version** in `manifest.json` (patch = bug fix, minor = new feature)
+2. **Backup**: `cp garmin-coach.mcpb backups/garmin-coach_pre-<version>-<desc>_$(date +%Y%m%d).mcpb`  
+   Prune to 2 most recent: `ls -t backups/garmin-coach_pre-*.mcpb | tail -n +3 | xargs rm -f`
+3. **Rebuild both bundles** (always build both — Kayleigh's bundle gets a patched manifest):
    ```bash
-   ls -t backups/garmin-coach_pre-*.mcpb | tail -n +3 | xargs rm -f
-   ```
-3. **Rebuild the mcpb bundle**:
-   ```bash
+   # Kyle's bundle (base manifest: garmin-coach)
    zip -r /tmp/garmin-coach-new.mcpb . \
-     -x "./backups/*" -x "./.DS_Store" -x "./__pycache__/*" -x "./server/__pycache__/*" -x "./garmin-coach.mcpb"
-   cp /tmp/garmin-coach-new.mcpb garmin-coach.mcpb
-   rm /tmp/garmin-coach-new.mcpb
+     -x "./backups/*" -x "./.DS_Store" -x "./__pycache__/*" -x "./server/__pycache__/*" \
+     -x "./garmin-coach.mcpb" -x "./garmin-coach-kayleigh.mcpb" \
+     -x "./.git/*" -x "./.gitignore" -x "./.claude/*" -x "./.venv/*"
+   cp /tmp/garmin-coach-new.mcpb garmin-coach.mcpb && rm /tmp/garmin-coach-new.mcpb
+
+   # Kayleigh's bundle — same code, name/display_name patched in manifest
+   python3 -c "
+   import json
+   m = json.load(open('manifest.json'))
+   m['name'] = 'garmin-coach-kayleigh'
+   m['display_name'] = 'Garmin Morning Coach (Kayleigh)'
+   json.dump(m, open('manifest.json', 'w'), indent=2)
+   "
+   zip -r /tmp/garmin-coach-kayleigh-new.mcpb . \
+     -x "./backups/*" -x "./.DS_Store" -x "./__pycache__/*" -x "./server/__pycache__/*" \
+     -x "./garmin-coach.mcpb" -x "./garmin-coach-kayleigh.mcpb" \
+     -x "./.git/*" -x "./.gitignore" -x "./.claude/*" -x "./.venv/*"
+   cp /tmp/garmin-coach-kayleigh-new.mcpb garmin-coach-kayleigh.mcpb && rm /tmp/garmin-coach-kayleigh-new.mcpb
+   # Restore manifest
+   python3 -c "
+   import json
+   m = json.load(open('manifest.json'))
+   m['name'] = 'garmin-coach'
+   m['display_name'] = 'Garmin Morning Coach'
+   json.dump(m, open('manifest.json', 'w'), indent=2)
+   "
    ```
-4. **Verify** the new mcpb contains updated files: `unzip -l garmin-coach.mcpb | grep <changed-file>`
+4. **Verify**: `unzip -l garmin-coach.mcpb | grep <changed-file>`
+5. **Deploy**: `./deploy.sh` — syncs both extensions into Claude and restarts the app
 
-Do NOT consider a change complete until the mcpb is rebuilt and the version is bumped.
+<!-- Current version is always in manifest.json — never hardcode it here -->
 
-## Current Version
+## Smoke Test
 
-`1.7.1` — last updated in `manifest.json`.
+```bash
+# Prompts for credentials and runs a quick data pull
+./run-test.sh
 
-## Project Structure
-
-- `server/main.py` — MCP server (~1750 lines), all tools, Garmin API logic, readiness scoring, calibration, weather
-- `manifest.json` — plugin manifest (version, 11 tool declarations, user config for garmin_email/garmin_password)
-- `start.sh` — self-healing startup script that fixes broken venv symlinks, installs deps
-- `requirements.txt` — `garminconnect`, `mcp`
-- `garmin-coach.mcpb` — distributable plugin bundle (zip of the project)
-- `backups/` — pre-change mcpb snapshots
-- `diagnose.sh` — import checker; run to verify venv and server startup are clean
-- `run-test.sh` — prompts for Garmin credentials and runs `server/main.py --test` for a quick smoke test
+# Import check only (no credentials needed)
+./diagnose.sh
+```
 
 ## Architecture
 
-### Server Setup
-- MCP server using `mcp.server.Server` with stdio transport (`mcp.server.stdio.stdio_server`)
-- Entry: `app = Server("garmin-coach")` in `server/main.py`
-- Started via `start.sh` → `.venv/bin/python3 server/main.py`
+### Server
 
-### Auth & Client
-- Garmin credentials passed as env vars `GARMIN_EMAIL` / `GARMIN_PASSWORD` (from manifest user_config)
-- Lazy-init cached client: `_client = None`, `get_client()` creates `Garmin(email, pw)` + `.login()` on first call
-- Client reused across all tool calls within a session
+- Entry point: `server/main.py` — `app = Server("garmin-coach")` with stdio transport
+- `@app.list_tools()` delegates to `get_tool_definitions()` in `tools.py`
+- `@app.call_tool()` is a single async if/elif dispatcher — no per-tool decorators
+- Each branch calls domain module functions and returns `[types.TextContent(...)]`
+- All business logic lives in domain modules, not in `main.py`
 
-### Tool Registration Pattern
-- `@app.list_tools()` — single async handler returning `list[types.Tool]` with JSON Schema `inputSchema`
-- `@app.call_tool()` — single async dispatcher `call_tool(name, arguments)` using `if/elif` branches
-- Each branch calls a **sync** `fetch_*` function, processes results, returns `[types.TextContent(...)]`
-- No per-tool decorators — everything routes through the one dispatcher
+### Garmin client
 
-### Data Flow
-1. Sync `fetch_*()` functions call `garminconnect` library methods (blocking)
-2. Processing/scoring functions (e.g., `assess_readiness()`) interpret raw data
-3. Dispatcher formats a text summary string and returns it as `TextContent`
+- Lazy singleton: `get_client()` in `garmin/client.py` — creates `Garmin(email, pw)` + `.login()` on first call
+- Credentials from env vars `GARMIN_EMAIL` / `GARMIN_PASSWORD` (injected by manifest user_config)
+- Client is reused across all tool calls in a session; no requests/httpx — stdlib `urllib` only
 
-## Tools (12 total)
+### Modules
 
-| Tool | Args | Fetcher | Description |
-|---|---|---|---|
-| `calibrate` | none | `calibrate_baselines()` | Pull 30 days of HRV + RHR from Garmin, compute personal baselines, save to `~/.garmin-coach.json`. Auto-runs on first use and silently every 7 days. |
-| `get_morning_metrics` | none | `fetch_morning_data()` | HRV, RHR, sleep, body battery, stress → GREEN/AMBER/RED readiness via `assess_readiness()` |
-| `get_training_load` | none | `fetch_training_load()` | Training status + ACWR from last 28 days of activities |
-| `get_fitness_trend` | none | `fetch_fitness_trend()` | VO2 Max sampled weekly over 6 weeks |
-| `get_recent_activities` | none | `fetch_recent_activities()` | Last 7 days of activities with distance/pace/HR/TE |
-| `analyze_run` | `activity_id` (int, opt) | `fetch_run_analysis()` + `analyze_running_form()` | Deep running dynamics analysis: cadence, stride length, ground contact time/balance, vertical oscillation/ratio, power, per-km splits, HR zones, and actionable form recommendations. Auto-selects most recent run if no ID given. |
-| `get_weekly_review` | none | `fetch_weekly_summary(0/1)` | This week vs last week: distance, time, sessions, best session, ACWR, coming-week recommendation |
-| `get_monthly_review` | none | `fetch_monthly_summary(0/1)` + `fetch_fitness_trend()` | This month vs last month: volume, consistency, longest run, VO2 Max movement, next-month focus |
-| `get_run_window` | `location` (str, opt) | `resolve_location()` + `fetch_weather_windows()` | Best time window to run today based on weather. Auto-detects location via IP; accepts named override (e.g. "Belfast") |
-| `create_running_workout` | `workout_name` (str), `description` (str, opt), `steps` (array) | direct client call | Creates structured running workout on Garmin Connect |
-| `create_strength_workout` | `workout_name` (str), `description` (str, opt), `exercises` (array) | direct client call | Creates strength workout on Garmin Connect |
-| `schedule_workout` | `workout_id` (int), `date` (str YYYY-MM-DD) | direct client call | Schedules existing workout to calendar date |
+- `server/main.py` — MCP dispatcher (`call_tool` if/elif chain); no business logic
+- `server/tools.py` — tool schema definitions (`get_tool_definitions`)
+- `server/utils.py` — shared helpers (`vo2max_to_hm_prediction`, etc.)
+- `server/garmin/` — Garmin API layer: client, calibration, readiness, analysis, training, schedule
+- `server/coaching/` — coaching logic: plan, thresholds, briefing, race_strategy, recovery_trend, weather
+- `server/db/` — SQLite persistence: history (workouts/feedback/coach_log), exercises (registry + aliases + defaults)
+- `server/workouts/` — workout creation: steps (builders), workouts (uploaders), validate (PreToolUse hook)
 
-## Calibration & Baselines
+## Garmin API Gotchas
 
-Personal baselines are stored in `~/.garmin-coach.json` and loaded at runtime by `load_baselines()`. The file is created automatically on first use and silently refreshed every `RECALIBRATE_AFTER_DAYS` (7) days.
+Date keying is inconsistent across endpoints — critical to get right:
 
-```json
-{
-  "calibrated_on": "2026-05-14",
-  "hrv_low": 75,
-  "hrv_high": 95,
-  "rhr_norm": 43,
-  "hrv_mean": 85.2,
-  "rhr_mean": 43.1,
-  "hrv_samples": 28,
-  "rhr_samples": 30,
-  "lookback_days": 30
-}
-```
+| Endpoint | Date arg | Returns |
+|---|---|---|
+| `get_sleep_data(date)` | **wake date** (not bed date) | last night's sleep |
+| `get_hrv_data(today)` | today | last night's overnight HRV |
+| `get_heart_rates(today)` | today | today's resting HR |
+| `get_body_battery(yesterday, today)` | range | body battery |
+| `get_stress_data(yesterday)` | yesterday | stress (today would be incomplete) |
 
-Fallback constants (used only when < 7 days of data exist):
+### Calibration baselines
 
+Stored in `~/.garmin-coach.json`, loaded via `load_baselines()` in `garmin/calibration.py`. Auto-created on first use, silently refreshed every 7 days (`RECALIBRATE_AFTER_DAYS`). `assess_readiness()` always calls `load_baselines()` — never use hardcoded values.
+
+Fallback constants (only when < 7 days of data): `HRV_LOW=50`, `HRV_HIGH=70`, `RHR_NORM=60`.
+
+## DB Conventions
+
+### Schema (SQLite at `~/.garmin-coach-history.db`)
+
+- `training_cycles` — one row per race/plan cycle
+- `workouts` — planned/completed sessions linked to cycle; `(date, type)` unique index
+- `feedback` — RPE/feel/niggles/notes, linked to workout row
+- `coach_log` — suggestions; `approved IS NULL` = pending, `1` = accepted, `0` = denied
+- `exercise_defaults` — default weight/sets/reps per variation; `name` is unique key
+- `garmin_exercises` + `exercise_aliases` — canonical exercise registry with many-to-one alias mapping
+
+### Migration pattern
+
+New columns use `ALTER TABLE ... ADD COLUMN` wrapped in `try/except sqlite3.OperationalError` — idempotent, safe to re-run on existing DBs. Add to the migration loop in `init_history_db`, not to the `CREATE TABLE` statement.
+
+### Connection pattern
+
+Every public function opens its own `sqlite3.connect(HISTORY_DB)` and closes in a `finally` block — no long-lived connections. Use `conn.row_factory = sqlite3.Row` when returning dicts.
+
+### Exercise seeding
+
+`_seed_garmin_exercises(conn)` is idempotent — checks `COUNT(*)` first, skips if > 0. `_SEED_MAP` is source of truth at seed time only; after seeding, the DB is authoritative.
+
+`garmin_category` and `garmin_exercise_name` must be pre-resolved by the caller (`main.py`) via `lookup_garmin_exercise(name)` before calling `set_exercise_defaults` — `db/exercises.py` does not import from `workouts/` (circular import risk).
+
+## Workout Builder
+
+### Running steps (`workouts/steps.py`)
+
+`build_running_steps(steps)` supports: `warmup`/`cooldown` (`duration_minutes`), `easy`/`interval` (`duration_minutes` OR `distance_meters`, optional `target_hr_zone`, `target_hr_low/high`, `target_pace_slow/fast` in sec/km), `recovery` (`duration_minutes`), `repeat` (`iterations` + nested `steps`).
+
+Pace conversion: `speed_m_s = 1000 / pace_sec`. Garmin requires `targetValueOne ≤ targetValueTwo` (slower m/s → faster m/s).
+
+### Strength steps (`workouts/steps.py`)
+
+`build_strength_steps(exercises)` returns `(steps, unmapped_names)`. Each exercise → `RepeatGroup(iterations=sets)` containing a work `ExecutableStep` + rest `ExecutableStep`.
+
+Weight fields on `ExecutableStep` (verified field names):
 ```python
-HRV_LOW_DEFAULT  = 50
-HRV_HIGH_DEFAULT = 70
-RHR_NORM_DEFAULT = 60
+weight_kwargs["weightValue"] = float(weight_kg)
+weight_kwargs["weightUnit"]  = {"unitKey": "kilogram"}
+# pass as **weight_kwargs — ConfigDict(extra="allow") lets them through
 ```
 
-`assess_readiness()` always calls `load_baselines()` — never hardcoded values.
+Exercise dict schema: `{name, sets?, reps?, duration_seconds?, rest_seconds?, weight_kg?}`
 
-## Imports
-
-```python
-import asyncio, json, os
-import urllib.parse, urllib.request
-from datetime import date, timedelta
-from pathlib import Path
-from garminconnect import Garmin
-from garminconnect.workout import (
-    BaseWorkout, RunningWorkout, FitnessEquipmentWorkout,
-    WorkoutSegment, ExecutableStep, RepeatGroup, StepType,
-    ConditionType, TargetType, create_warmup_step,
-    create_cooldown_step, create_interval_step,
-    create_recovery_step, create_repeat_group,
-)
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp import types
-```
-
-## Garmin API Date Conventions
-
-- **Sleep**: `get_sleep_data(date)` keys on the **wake date**, not the bed date. Use `today` for last night's sleep.
-- **HRV**: `get_hrv_data(today)` returns last night's overnight HRV.
-- **Heart Rate / RHR**: `get_heart_rates(today)` returns today's resting HR.
-- **Body Battery**: range query `get_body_battery(yesterday, today)`.
-- **Stress**: `get_stress_data(yesterday)` returns a full day of data (today would be incomplete in the morning).
-
-## Weather (Open-Meteo)
-
-- `resolve_location(location_str | None)` — if a location string is given, geocodes via `geocoding-api.open-meteo.com`; otherwise falls back to `ip-api.com` for IP-based geolocation.
-- `fetch_weather_windows(lat, lon)` — fetches today's hourly forecast from `api.open-meteo.com` (free, no API key). Returns 24-hour array with temperature, feels-like, precipitation probability, wind speed, WMO weather code, UV index.
-- `_score_hour(h)` — scores a single hour 0–100 for running suitability.
-- `find_best_run_window(hours, is_weekday)` — evaluates candidate windows (weekday: morning + lunch; weekend: 5 windows) and ranks by score.
-
-## Dependencies
-
-- `garminconnect` — Garmin Connect API wrapper (sync calls)
-- `mcp` — Model Context Protocol server framework
-- `urllib.request` / `urllib.parse` — stdlib; used for Open-Meteo weather + geocoding and ip-api.com geolocation
-- No third-party HTTP libraries (requests/httpx/aiohttp)
+When `create_and_upload_strength_workout` returns unmapped names, `main.py` warns the user and suggests `set_exercise_defaults` with explicit Garmin mapping.
