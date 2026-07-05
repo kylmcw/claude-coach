@@ -312,3 +312,63 @@ class TestFormatPlanContext:
         out = plan_mod.format_plan_context(plan)
         assert "B Race" in out
         assert "B Race Tune-up" in out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# plan_week_sessions — logged-feedback back-off (overrides "looks fine" load)
+# ─────────────────────────────────────────────────────────────────────────────
+
+import db.history as history_mod
+
+
+def _future_plan():
+    today = date.today()
+    return {
+        "race_date":         (today + timedelta(days=90)).isoformat(),
+        "created_on":        today.isoformat(),
+        "total_weeks":       12,
+        "run_days_per_week": 4,
+        "blocked_days":      [],
+    }
+
+
+def _next_monday():
+    today = date.today()
+    return today - timedelta(days=today.weekday()) + timedelta(weeks=1)
+
+
+def _total_planned_km(sessions):
+    return sum(s["planned_distance_km"] for s in sessions)
+
+
+def _fb(backoff):
+    return lambda *a, **k: {
+        "niggle_warnings": [], "avg_rpe": None, "high_rpe_count": 0,
+        "rough_feel_count": 0, "backoff": backoff,
+        "reason": "recurring calf niggle" if backoff else None, "lines": [],
+    }
+
+
+def test_plan_week_backs_off_on_adverse_feedback(monkeypatch):
+    # Garmin load reads fine (PRODUCTIVE → hold, no scaling), but logged feedback
+    # flags a recurring niggle → planned volume must drop.
+    plan = _future_plan()
+    load = {"training_status": "PRODUCTIVE_6", "load_focus": None}
+
+    monkeypatch.setattr(history_mod, "assess_recent_feedback", _fb(False))
+    baseline = plan_mod.plan_week_sessions(plan, _next_monday(), 40.0, load)
+
+    monkeypatch.setattr(history_mod, "assess_recent_feedback", _fb(True))
+    backed_off = plan_mod.plan_week_sessions(plan, _next_monday(), 40.0, load)
+
+    assert baseline and backed_off
+    assert _total_planned_km(backed_off) < _total_planned_km(baseline)
+
+
+def test_plan_week_no_backoff_leaves_volume(monkeypatch):
+    plan = _future_plan()
+    load = {"training_status": "PRODUCTIVE_6", "load_focus": None}
+    monkeypatch.setattr(history_mod, "assess_recent_feedback", _fb(False))
+    sessions = plan_mod.plan_week_sessions(plan, _next_monday(), 40.0, load)
+    # No back-off, hold tier, Base phase → full target roughly preserved.
+    assert _total_planned_km(sessions) > 35.0

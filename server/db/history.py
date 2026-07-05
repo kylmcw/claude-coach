@@ -75,6 +75,11 @@ def init_history_db() -> None:
                 created_at       TEXT DEFAULT CURRENT_TIMESTAMP
             );
             CREATE UNIQUE INDEX IF NOT EXISTS uq_workout_date_type ON workouts(date, type);
+            CREATE TABLE IF NOT EXISTS week_plans (
+                week_start  TEXT PRIMARY KEY,
+                planned_at  TEXT NOT NULL,
+                planned_by  TEXT
+            );
         """)
         conn.commit()
 
@@ -110,6 +115,35 @@ def init_history_db() -> None:
             except sqlite3.OperationalError:
                 pass
         conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_week_planned(week_start: str, planned_by: str = "generate_week") -> None:
+    """Record that a week has been fully planned. week_start = ISO date of Monday."""
+    from datetime import datetime
+    conn = sqlite3.connect(HISTORY_DB)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO week_plans (week_start, planned_at, planned_by) VALUES (?, ?, ?)",
+            (week_start, datetime.utcnow().isoformat(), planned_by),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def is_week_planned(week_start: str) -> dict:
+    """Return planning status for a week. week_start = ISO date of Monday."""
+    conn = sqlite3.connect(HISTORY_DB)
+    try:
+        row = conn.execute(
+            "SELECT week_start, planned_at, planned_by FROM week_plans WHERE week_start = ?",
+            (week_start,),
+        ).fetchone()
+        if row:
+            return {"planned": True, "week_start": row[0], "planned_at": row[1], "planned_by": row[2]}
+        return {"planned": False, "week_start": week_start}
     finally:
         conn.close()
 
@@ -270,6 +304,92 @@ def fetch_workout_history(limit: int = 20, current_cycle_only: bool = True) -> l
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+_NIGGLE_KEYWORDS = (
+    "calf", "achilles", "knee", "hip", "hamstring", "shin", "ankle", "foot",
+    "plantar", "it band", "quad", "glute", "back", "shoulder", "arm",
+)
+_ROUGH_FEELINGS = ("bad", "rough", "flat", "tired", "poor", "sluggish", "awful")
+
+
+def assess_recent_feedback(days: int = 14, limit: int = 60) -> dict:
+    """
+    Scan recent logged feedback (RPE / feel / niggles) for warning patterns.
+    Reads the workouts⨝feedback join via fetch_workout_history — no new schema.
+
+    Returns:
+      niggle_warnings — list[str], one per body part mentioned >=3x in window
+      avg_rpe         — mean logged RPE in window (float) or None
+      high_rpe_count  — sessions with RPE >= 8
+      rough_feel_count— sessions whose feel reads rough/flat/tired
+      backoff         — bool: recent feedback warrants easing next week
+      reason          — str | None: why backoff was set
+      lines           — list[str]: ready-to-print review lines (niggles + RPE/feel)
+    """
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    try:
+        rows = fetch_workout_history(limit=limit, current_cycle_only=False)
+    except Exception:
+        rows = []
+    rows = [r for r in rows if (r.get("date") or "") >= cutoff]
+
+    niggle_counts: dict[str, int] = {}
+    rpes: list[int] = []
+    high_rpe_count = 0
+    rough_feel_count = 0
+
+    for r in rows:
+        niggle = (r.get("niggles") or "").lower()
+        for kw in _NIGGLE_KEYWORDS:
+            if kw in niggle:
+                niggle_counts[kw] = niggle_counts.get(kw, 0) + 1
+        rpe = r.get("rpe")
+        if isinstance(rpe, (int, float)):
+            rpes.append(int(rpe))
+            if rpe >= 8:
+                high_rpe_count += 1
+        feel = (r.get("feel") or "").lower()
+        if feel and any(f in feel for f in _ROUGH_FEELINGS):
+            rough_feel_count += 1
+
+    niggle_warnings = [
+        f"RECURRING NIGGLE: '{kw}' mentioned {n}x in the last {days} days — "
+        "monitor closely and consider reducing load or seeking assessment."
+        for kw, n in niggle_counts.items() if n >= 3
+    ]
+    avg_rpe = round(sum(rpes) / len(rpes), 1) if rpes else None
+
+    # Back off if a niggle keeps recurring, or effort/feel trend shows fatigue.
+    reason = None
+    if niggle_warnings:
+        reason = niggle_warnings[0].split(" — ")[0]
+    elif high_rpe_count >= 3:
+        reason = f"{high_rpe_count} sessions at RPE >=8 in the last {days} days"
+    elif avg_rpe is not None and avg_rpe >= 7.5:
+        reason = f"average logged RPE {avg_rpe} over {len(rpes)} sessions"
+    elif rough_feel_count >= 3:
+        reason = f"{rough_feel_count} sessions logged as rough/flat in the last {days} days"
+    backoff = reason is not None
+
+    lines = list(niggle_warnings)
+    if avg_rpe is not None:
+        rpe_line = f"RPE (last {days}d): avg {avg_rpe} over {len(rpes)} session(s)"
+        if high_rpe_count:
+            rpe_line += f" — {high_rpe_count} at RPE >=8 (hard)"
+        lines.append(rpe_line)
+    if rough_feel_count >= 2:
+        lines.append(f"FEEL: {rough_feel_count} recent session(s) logged rough/flat — watch cumulative fatigue.")
+
+    return {
+        "niggle_warnings":  niggle_warnings,
+        "avg_rpe":          avg_rpe,
+        "high_rpe_count":   high_rpe_count,
+        "rough_feel_count": rough_feel_count,
+        "backoff":          backoff,
+        "reason":           reason,
+        "lines":            lines,
+    }
 
 
 def _planned_row_for_date(conn: sqlite3.Connection, date_str: str, sport: str | None = None) -> dict | None:
@@ -511,7 +631,7 @@ def generate_week_plan(
     plan: dict,
     week_start_date: date,
     target_km: float,
-    acwr: float | None,
+    load_data: dict | None,
 ) -> list[dict]:
     """
     For each session returned by plan_week_sessions():
@@ -525,7 +645,7 @@ def generate_week_plan(
     from workouts.workouts import create_and_upload_running_workout
     from garmin.client import get_client
 
-    sessions  = plan_week_sessions(plan, week_start_date, target_km, acwr)
+    sessions  = plan_week_sessions(plan, week_start_date, target_km, load_data)
     client    = get_client()
     created   = []
 

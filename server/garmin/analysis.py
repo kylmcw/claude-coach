@@ -92,7 +92,36 @@ def grade_execution(data: dict) -> list[str]:
     return lines
 
 
-def format_run_analysis(data: dict, plan_context: str = "") -> str:
+def build_week_context(recent_activities: list[dict], load_data: dict | None) -> str:
+    """
+    One short block summarising the current 7-day training context, so single-run
+    analysis isn't blind to what else happened this week (e.g. a threshold + VO2max
+    session already done — don't tell the athlete to "add quality"). Returns "" if
+    there's nothing to show.
+    """
+    acts = recent_activities or []
+    if not acts:
+        return ""
+
+    # "Hard/quality" = meaningful anaerobic effort or a high aerobic training effect.
+    hard = [a for a in acts
+            if (a.get("anaerobic_te") or 0) >= 1.0 or (a.get("aerobic_te") or 0) >= 3.5]
+    run_km = round(sum((a.get("distance_km") or 0) for a in acts
+                       if "running" in (a.get("type") or "")), 1)
+    status = (load_data or {}).get("training_status") or "N/A"
+    focus  = (load_data or {}).get("load_focus")
+
+    lines = [f"THIS WEEK SO FAR (last 7d): {len(acts)} session(s), {run_km} km running."]
+    if hard:
+        desc = ", ".join(f"{h.get('date')} {h.get('type')}" for h in hard[:3])
+        lines.append(f"  Quality/hard already done: {len(hard)} ({desc}) — factor this before prescribing more intensity.")
+    else:
+        lines.append("  No hard/quality sessions in the last 7 days.")
+    lines.append(f"  Training status: {status}" + (f"  |  load focus: {focus}" if focus else ""))
+    return "\n".join(lines)
+
+
+def format_run_analysis(data: dict, plan_context: str = "", week_context: str = "") -> str:
     lines = [
         f"RUN ANALYSIS — {data['date']}",
         f"  {data['activity_name']} ({data['activity_type']})",
@@ -135,7 +164,8 @@ def format_run_analysis(data: dict, plan_context: str = "") -> str:
         lines.append("  No running dynamics data available (requires compatible device).")
 
     if data["splits"]:
-        lines.append("\nSPLITS:")
+        split_label = "SPLITS (per km):" if data.get("splits_source") == "distance" else "SPLITS (laps):"
+        lines.append(f"\n{split_label}")
         lines.append(f"  {'#':<4} {'Dist':>6} {'Pace':>10} {'HR':>6} {'Cadence':>8} {'Elev+':>7}")
         lines.append(f"  {'—'*4} {'—'*6} {'—'*10} {'—'*6} {'—'*8} {'—'*7}")
         hilly_splits = []
@@ -185,6 +215,10 @@ def format_run_analysis(data: dict, plan_context: str = "") -> str:
         for g in grading:
             lines.append(f"  {g}")
 
+    # ── Weekly context (so a single run isn't judged in isolation) ────────
+    if week_context:
+        lines.append(f"\n{week_context}")
+
     lines.append(plan_context)
     return "\n".join(lines)
 
@@ -226,11 +260,58 @@ def fetch_run_analysis(activity_id: str | int | None = None) -> dict:
         summary.update(summary_raw["summaryDTO"])
 
     # ── Fetch splits ──────────────────────────────────────────────────────
+    # Prefer per-km distance auto-splits (split_summaries) over lap-button
+    # splits.  Lap-button splits produce tiny segments (0.02 km, 0.11 km)
+    # wherever the user pressed the lap button to mark workout phases
+    # (warmup end, interval start, etc.), making the output unreadable.
+    # split_summaries gives clean ~1 km segments regardless of lap presses.
     splits = None
+    splits_source = None          # "distance" or "lap"
     try:
-        splits = client.get_activity_splits(activity_id)
+        raw_summaries = client.get_activity_split_summaries(activity_id)
+        if raw_summaries:
+            # split_summaries groups by splitType — pick the active running
+            # segments which contain per-km distance splits.
+            _ACTIVE_TYPES = {
+                "RUN_ACTIVE", "INTERVAL_ACTIVE", "run_active",
+                "interval_active",
+            }
+            summaries_list = (
+                raw_summaries.get("splitSummaries")
+                or raw_summaries.get("splits")
+                or (raw_summaries if isinstance(raw_summaries, list) else [])
+            )
+            for group in summaries_list:
+                stype = group.get("splitType") or ""
+                if stype.upper() in {t.upper() for t in _ACTIVE_TYPES}:
+                    inner = group.get("splits") or []
+                    if inner:
+                        splits = {"distanceSplits": inner}
+                        splits_source = "distance"
+                        break
+            # If no active-type group found, take the first group that has
+            # per-km-ish splits (distance ≈ 1000 m each).
+            if splits is None:
+                for group in summaries_list:
+                    inner = group.get("splits") or []
+                    if inner and len(inner) >= 2:
+                        avg_dist = sum(
+                            s.get("distance") or 0 for s in inner
+                        ) / len(inner)
+                        if 800 < avg_dist < 1800:  # ~1 km per split
+                            splits = {"distanceSplits": inner}
+                            splits_source = "distance"
+                            break
     except Exception:
         pass
+
+    # Fall back to lap-button splits if distance splits unavailable
+    if splits is None:
+        try:
+            splits = client.get_activity_splits(activity_id)
+            splits_source = "lap"
+        except Exception:
+            pass
 
     # ── Fetch HR zone breakdown ───────────────────────────────────────────
     hr_zones = None
@@ -278,19 +359,34 @@ def fetch_run_analysis(activity_id: str | int | None = None) -> dict:
     # ── Parse splits ──────────────────────────────────────────────────────
     parsed_splits = []
     if splits:
-        split_list = splits.get("lapDTOs") or splits.get("splitSummaries") or []
-        if not split_list:
-            # Try alternative structure
-            split_list = splits if isinstance(splits, list) else []
+        # Resolve the list of split dicts from whichever source we used.
+        if splits_source == "distance":
+            split_list = splits.get("distanceSplits") or []
+        else:
+            split_list = (
+                splits.get("lapDTOs")
+                or splits.get("splitSummaries")
+                or (splits if isinstance(splits, list) else [])
+            )
+
         for i, s in enumerate(split_list):
             s_dist = round((s.get("distance") or 0) / 1000, 2)
-            s_dur = s.get("duration") or s.get("elapsedDuration") or 0
+            s_dur = (
+                s.get("duration")
+                or s.get("movingDuration")
+                or s.get("elapsedDuration")
+                or 0
+            )
             s_dur_sec = s_dur if s_dur < 10000 else s_dur / 1000  # handle ms vs s
             if s_dist > 0 and s_dur_sec > 0:
                 s_pace_sec = round(s_dur_sec / s_dist)
                 s_pace = f"{s_pace_sec // 60}:{s_pace_sec % 60:02d}/km"
             else:
                 s_pace = "N/A"
+
+            # split_summaries uses totalAscent; lap splits use elevationGain
+            elev = s.get("elevationGain") or s.get("totalAscent")
+
             parsed_splits.append({
                 "split": i + 1,
                 "distance_km": s_dist,
@@ -299,7 +395,7 @@ def fetch_run_analysis(activity_id: str | int | None = None) -> dict:
                 "avg_hr": s.get("averageHR"),
                 "max_hr": s.get("maxHR"),
                 "avg_cadence": s.get("averageRunCadence"),
-                "elevation_gain": s.get("elevationGain"),
+                "elevation_gain": elev,
             })
 
     # ── Parse HR zones ────────────────────────────────────────────────────
@@ -348,6 +444,7 @@ def fetch_run_analysis(activity_id: str | int | None = None) -> dict:
         "training_stress_score": training_stress_score,
         # Splits and zones
         "splits": parsed_splits,
+        "splits_source": splits_source,   # "distance" or "lap"
         "hr_zones": parsed_hr_zones,
     }
 

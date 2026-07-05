@@ -208,16 +208,19 @@ def test_log_strength_progress_completed_increases_weight(ex_db):
     assert rows[0]["weight_kg"] == 110.0
 
 
-def test_log_strength_progress_failed_decreases_weight(ex_db):
+def test_log_strength_progress_failed_holds_weight(ex_db):
+    """Ratchet policy: a failed/off session never auto-lowers the stored default.
+    It holds the weight and flags for explicit review instead."""
     exercises.set_exercise_defaults([{"name": "Deadlift", "weight_kg": 120.0, "sets": 3, "reps": 5}])
     result = exercises.log_strength_progress([{"name": "Deadlift", "completed": False}])
 
     s = result["suggestions"][0]
     assert s["outcome"]      == "failed"
-    assert s["suggested_kg"] == 107.5   # floor(120 * 0.9 / 2.5) * 2.5 = 107.5
+    assert s["suggested_kg"] is None     # not lowered
+    assert s["needs_review"] is True
 
     rows = exercises.get_exercise_defaults("Deadlift")
-    assert rows[0]["weight_kg"] == 107.5
+    assert rows[0]["weight_kg"] == 120.0  # default held
 
 
 def test_log_strength_progress_apply_changes_false(ex_db):
@@ -345,3 +348,35 @@ def test_check_progression_suggestion_kg_rounds_up(ex_db):
     result = exercises.check_progression_due("CURL")
     assert result["due"]           is True
     assert result["suggestion_kg"] == 17.5   # 14 + 2.5 = 16.5 → ceil to 17.5
+
+
+# ─── Exercise overrides ─────────────────────────────────────────────────────────
+
+def test_override_adjusts_effective_not_base(ex_db):
+    """An override changes the programmed (effective) weight but never the base default."""
+    exercises.set_exercise_defaults([{"name": "Squat", "weight_kg": 100, "sets": 3, "reps": 5}])
+    exercises.set_exercise_override("Squat", "pct", -20, label="sick")
+    row = exercises.get_exercise_defaults("Squat")[0]
+    assert row["weight_kg"] == 100              # base untouched
+    assert row["effective_weight_kg"] == 80     # 100 - 20%
+
+    # delta override is the newest active → wins (no stacking)
+    exercises.set_exercise_override("Squat", "delta", -10)
+    row = exercises.get_exercise_defaults("Squat")[0]
+    assert row["effective_weight_kg"] == 90     # 100 - 10, not 80-10
+
+
+def test_override_window_scopes_by_date(ex_db):
+    """Outside its start/end window an override is inactive; base weight applies."""
+    exercises.set_exercise_defaults([{"name": "Bench", "weight_kg": 80}])
+    exercises.set_exercise_override("Bench", "delta", -20,
+                                    start_date="2026-01-10", end_date="2026-01-20")
+    assert exercises.get_exercise_defaults("Bench", on_date="2026-01-15")[0]["effective_weight_kg"] == 60
+    assert exercises.get_exercise_defaults("Bench", on_date="2026-02-01")[0]["effective_weight_kg"] == 80
+
+
+def test_clear_override_reverts_to_base(ex_db):
+    exercises.set_exercise_defaults([{"name": "Press", "weight_kg": 50}])
+    exercises.set_exercise_override("Press", "pct", -20, label="deload")
+    assert exercises.clear_exercise_override(label="deload") == 1
+    assert exercises.get_exercise_defaults("Press")[0]["effective_weight_kg"] == 50

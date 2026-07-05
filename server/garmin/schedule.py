@@ -4,6 +4,59 @@ from datetime import date, timedelta
 from garmin.client import get_client
 
 
+def _workout_items(month_data) -> list[tuple[str, dict]]:
+    """Yield (item_date_iso, {"workout_id", "schedule"}) for each workout-shaped
+    calendar item in a get_scheduled_workouts() payload.
+
+    Garmin returns {"calendarItems": [...]} on the calendar-service endpoint, but
+    key names drift across endpoints/versions — sniff the documented shape and
+    fall back to known aliases rather than trust one spelling.
+    """
+    if isinstance(month_data, list):
+        items = month_data
+    else:
+        items = (
+            month_data.get("calendarItems")
+            or month_data.get("workoutSchedules")
+            or month_data.get("items")
+            or []
+        )
+
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_date = (
+            item.get("date")
+            or item.get("scheduleDate")
+            or item.get("scheduledDate")
+            or item.get("calendarDate")
+        )
+        item_type = (item.get("itemType") or "").lower()
+        if item_type and item_type != "workout":
+            continue  # skip logged activities, notes
+        workout_id = item.get("workoutId") or item.get("workout_id") or item.get("id")
+        if not item_date or not workout_id:
+            continue
+        out.append((item_date, {"workout_id": workout_id, "schedule": item}))
+    return out
+
+
+def _fetch_full_workouts(client, matches: list[dict]) -> list[dict]:
+    """Resolve each {"workout_id", "schedule"} match to its full workout dict,
+    stashing the schedule metadata under _scheduleMeta for the formatter."""
+    workouts = []
+    for m in matches:
+        try:
+            full = client.get_workout_by_id(m["workout_id"])
+        except Exception as e:
+            full = {"_fetch_error": str(e), "workoutId": m["workout_id"]}
+        if isinstance(full, dict):
+            full.setdefault("_scheduleMeta", m["schedule"])
+        workouts.append(full)
+    return workouts
+
+
 def fetch_scheduled_workout(date_str: str | None = None) -> dict:
     """
     Look up workouts scheduled on the Garmin calendar for a given date.
@@ -28,55 +81,8 @@ def fetch_scheduled_workout(date_str: str | None = None) -> dict:
     client = get_client()
     month_data = client.get_scheduled_workouts(target.year, target.month) or {}
 
-    # Garmin returns {"calendarItems": [...]} on the calendar-service endpoint.
-    # Each item carries a `date` (YYYY-MM-DD) and an `itemType` ("workout",
-    # "activity", "note", ...). Be defensive — if the API ever changes shape
-    # to a bare list, handle that too.
-    if isinstance(month_data, list):
-        items = month_data
-    else:
-        items = (
-            month_data.get("calendarItems")
-            or month_data.get("workoutSchedules")
-            or month_data.get("items")
-            or []
-        )
-
-    matches = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        item_date = (
-            item.get("date")
-            or item.get("scheduleDate")
-            or item.get("scheduledDate")
-            or item.get("calendarDate")
-        )
-        if item_date != target_iso:
-            continue
-        # Only consider workout-shaped items (skip logged activities, notes).
-        item_type = (item.get("itemType") or "").lower()
-        if item_type and item_type != "workout":
-            continue
-        workout_id = (
-            item.get("workoutId")
-            or item.get("workout_id")
-            or item.get("id")
-        )
-        if not workout_id:
-            continue
-        matches.append({"workout_id": workout_id, "schedule": item})
-
-    workouts = []
-    for m in matches:
-        try:
-            full = client.get_workout_by_id(m["workout_id"])
-        except Exception as e:
-            full = {"_fetch_error": str(e), "workoutId": m["workout_id"]}
-        # Stash schedule metadata on the returned dict for the formatter.
-        if isinstance(full, dict):
-            full.setdefault("_scheduleMeta", m["schedule"])
-        workouts.append(full)
+    matches = [m for d, m in _workout_items(month_data) if d == target_iso]
+    workouts = _fetch_full_workouts(client, matches)
 
     return {"date": target_iso, "workouts": workouts}
 
@@ -110,54 +116,16 @@ def fetch_future_schedule(days: int = 7) -> list[dict]:
 
     for (year, month) in month_map:
         month_data = client.get_scheduled_workouts(year, month) or {}
-        if isinstance(month_data, list):
-            items = month_data
-        else:
-            items = (
-                month_data.get("calendarItems")
-                or month_data.get("workoutSchedules")
-                or month_data.get("items")
-                or []
-            )
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            item_date = (
-                item.get("date")
-                or item.get("scheduleDate")
-                or item.get("scheduledDate")
-                or item.get("calendarDate")
-            )
-            if item_date not in items_by_date:
-                continue
-            item_type = (item.get("itemType") or "").lower()
-            if item_type and item_type != "workout":
-                continue
-            workout_id = (
-                item.get("workoutId")
-                or item.get("workout_id")
-                or item.get("id")
-            )
-            if not workout_id:
-                continue
-            items_by_date[item_date].append({"workout_id": workout_id, "schedule": item})
+        for item_date, match in _workout_items(month_data):
+            if item_date in items_by_date:
+                items_by_date[item_date].append(match)
 
     # Fetch full workout details for each matched entry
-    results = []
-    for d in dates:
-        date_iso = d.isoformat()
-        workouts = []
-        for m in items_by_date[date_iso]:
-            try:
-                full = client.get_workout_by_id(m["workout_id"])
-            except Exception as e:
-                full = {"_fetch_error": str(e), "workoutId": m["workout_id"]}
-            if isinstance(full, dict):
-                full.setdefault("_scheduleMeta", m["schedule"])
-            workouts.append(full)
-        results.append({"date": date_iso, "workouts": workouts})
-
-    return results
+    return [
+        {"date": d.isoformat(),
+         "workouts": _fetch_full_workouts(client, items_by_date[d.isoformat()])}
+        for d in dates
+    ]
 
 
 # ─── Scheduled workout formatter ─────────────────────────────────────────────

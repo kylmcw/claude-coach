@@ -1,14 +1,14 @@
 import asyncio
 import json
-from datetime import date
+from datetime import date, timedelta
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
 
-from garmin.calibration import (calibrate_baselines, load_baselines,
+from garmin.calibration import (calibrate_baselines,
                                 CALIBRATION_FILE, CALIBRATION_LOOKBACK, RECALIBRATE_AFTER_DAYS)
-from garmin.readiness import fetch_morning_data, assess_readiness, assess_acwr
+from garmin.readiness import fetch_morning_data, assess_readiness, assess_training_state
 from garmin.training import (fetch_training_load, fetch_fitness_trend, fetch_recent_activities,
                               fetch_weekly_summary, fetch_monthly_summary,
                               fetch_garmin_race_predictions, format_weekly_review, format_monthly_review,
@@ -16,23 +16,34 @@ from garmin.training import (fetch_training_load, fetch_fitness_trend, fetch_rec
                               fetch_strength_exercise_sets)
 from garmin.schedule import (fetch_scheduled_workout, fetch_future_schedule,
                               _format_scheduled_workout, _format_future_schedule)
-from garmin.analysis import fetch_run_analysis, format_run_analysis
+from garmin.analysis import fetch_run_analysis, format_run_analysis, build_week_context
 from garmin.client import get_client
 from db.history import (log_workout_to_history, fetch_workout_history, auto_log_missed_workouts,
                         backfill_runs, log_coach_suggestion, fetch_pending_suggestions,
-                        review_suggestion, generate_week_plan)
+                        review_suggestion, generate_week_plan, mark_week_planned, is_week_planned)
 from db.exercises import (set_exercise_defaults, get_exercise_defaults, log_strength_progress,
-                           lookup_garmin_exercise, log_exercise_completions, check_progression_due)
+                           lookup_garmin_exercise, log_exercise_completions, check_progression_due,
+                           set_exercise_override, clear_exercise_override)
 from coaching.plan import (load_plan, save_plan, format_plan_context, _NO_PLAN_NUDGE, PLAN_FILE,
                             build_setup_questionnaire, create_plan_from_args, format_plan_status)
 from coaching.weather import resolve_location, fetch_weather_windows, find_best_run_window
 from coaching.briefing import get_daily_briefing
 from coaching.recovery_trend import fetch_recovery_trend, analyze_recovery_trend, format_recovery_trend
 from coaching.race_strategy import build_race_strategy
+from coaching.thresholds import get_zones, fmt_pace
 from workouts.workouts import (create_and_upload_running_workout, create_and_upload_strength_workout)
 from tools import get_tool_definitions
 
 app = Server("garmin-coach")
+
+
+def _week_start_arg(arguments: dict | None) -> str:
+    """The week_start arg, or this week's Monday (ISO date)."""
+    raw = (arguments or {}).get("week_start")
+    if raw:
+        return raw
+    today = date.today()
+    return (today - timedelta(days=today.weekday())).isoformat()
 
 
 # ─── MCP tool registry ────────────────────────────────────────────────────────
@@ -146,7 +157,7 @@ async def call_tool(name: str, arguments: dict):
 
     elif name == "get_training_load":
         data = fetch_training_load()
-        acwr_assessment = assess_acwr(data["acwr"])
+        acwr_assessment = assess_training_state(data)
 
         from garmin.training import _fmt_load_focus
         load_focus_str = _fmt_load_focus(data.get("load_focus")) or "N/A"
@@ -156,7 +167,7 @@ async def call_tool(name: str, arguments: dict):
             f"  Garmin Load (7d):       {data['training_load_7d'] or 'N/A'}\n"
             f"  Acute Load (7d):        {data['acute_load']}\n"
             f"  Chronic Load (4wk avg): {data['chronic_load']}\n"
-            f"  ACWR:                   {data['acwr'] or 'N/A'}\n"
+            f"  ACWR:                   {data['acwr'] or 'N/A'}  (reference only — training status governs, do NOT judge against 0.8–1.3)\n"
             f"  Load Focus:             {load_focus_str}\n"
             f"  Sessions (last 7d):     {data['sessions_last_7d']}\n"
             f"  Sessions (last 28d):    {data['sessions_last_28d']}\n\n"
@@ -214,7 +225,13 @@ async def call_tool(name: str, arguments: dict):
             return [types.TextContent(type="text", text=f"ANALYZE RUN ERROR — {data['error']}")]
         plan = load_plan()
         ctx = format_plan_context(plan) if plan else _NO_PLAN_NUDGE
-        return [types.TextContent(type="text", text=format_run_analysis(data, ctx))]
+        # Give the single-run analysis visibility into the rest of the week so it
+        # doesn't prescribe quality that's already been done.
+        try:
+            week_ctx = build_week_context(fetch_recent_activities(7), fetch_training_load())
+        except Exception:
+            week_ctx = ""
+        return [types.TextContent(type="text", text=format_run_analysis(data, ctx, week_ctx))]
 
     elif name == "create_running_workout":
         workout_name = arguments["workout_name"]
@@ -587,6 +604,34 @@ async def call_tool(name: str, arguments: dict):
         lines   = ["EXERCISE DEFAULTS SAVED:"] + [f"  {r}" for r in results]
         return [types.TextContent(type="text", text="\n".join(lines))]
 
+    elif name == "set_exercise_override":
+        r = set_exercise_override(
+            name=arguments["name"],
+            kind=arguments["kind"],
+            value=arguments["value"],
+            label=arguments.get("label"),
+            start_date=arguments.get("start_date"),
+            end_date=arguments.get("end_date"),
+        )
+        adj    = f"{r['value']:+g}%" if r["kind"] == "pct" else f"{r['value']:+g}kg"
+        window = " to ".join(d for d in (r["start_date"], r["end_date"]) if d) or "open-ended"
+        base   = f"{r['base_kg']}kg" if r["base_kg"] is not None else "no base default"
+        eff    = f"{r['effective_kg']}kg" if r["effective_kg"] is not None else "—"
+        lines  = [
+            f"OVERRIDE SET: {r['name']} {adj}" + (f" [{r['label']}]" if r["label"] else ""),
+            f"  base {base} → programmed {eff}   (window: {window})",
+            "  Base default unchanged — reverts automatically when the window ends or you clear it.",
+        ]
+        return [types.TextContent(type="text", text="\n".join(lines))]
+
+    elif name == "clear_exercise_override":
+        n = clear_exercise_override(
+            name=(arguments or {}).get("name"),
+            label=(arguments or {}).get("label"),
+            clear_all=bool((arguments or {}).get("all")),
+        )
+        return [types.TextContent(type="text", text=f"Cleared {n} active override(s). Weights revert to base defaults.")]
+
     elif name == "get_exercise_defaults":
         name_filter = (arguments or {}).get("name")
         rows = get_exercise_defaults(name_filter)
@@ -612,18 +657,41 @@ async def call_tool(name: str, arguments: dict):
         applied       = result["applied"]
 
         lines = ["STRENGTH PROGRESSION REPORT:"]
+        held_for_review = 0
         for s in suggestions:
             if s["current_kg"] is None:
                 lines.append(f"  ⚠ {s['exercise']}: {s['note']}")
+            elif s.get("needs_review"):
+                # Failed/off session — default held (ratchet). Log a pending suggestion so the
+                # decision to lower is explicit, never silent. Only when actually applying.
+                lines.append(f"  ✗ {s['exercise']}: {s['action']}")
+                if s.get("notes"):
+                    lines.append(f"    ↳ {s['notes']}")
+                if applied:
+                    held_for_review += 1
+                    log_coach_suggestion(
+                        trigger="strength_session_failed",
+                        context_summary=f"{s['exercise']} failed at {s['current_kg']}kg"
+                                        + (f" — {s['notes']}" if s.get("notes") else ""),
+                        recommendation=f"Review whether to lower {s['exercise']} below {s['current_kg']}kg",
+                        rationale="Ratchet policy: failed/off sessions never auto-lower the stored "
+                                  "default (a sick day shouldn't drop base capacity). Lower manually "
+                                  "via set_exercise_defaults only if the failure reflects true capacity.",
+                        action_type="strength_weight_review",
+                    )
             else:
-                icon = "✓" if s["outcome"] == "completed" else "✗"
                 lines.append(
-                    f"  {icon} {s['exercise']}: {s['current_kg']}kg → {s['suggested_kg']}kg  ({s['action']})"
+                    f"  ✓ {s['exercise']}: {s['current_kg']}kg → {s['suggested_kg']}kg  ({s['action']})"
                 )
                 if s.get("notes"):
                     lines.append(f"    ↳ {s['notes']}")
         if applied:
             lines.append("\nDefaults updated — weights will apply to next workout automatically.")
+            if held_for_review:
+                lines.append(
+                    f"{held_for_review} failed exercise(s) held at current weight and logged for "
+                    "review (use get_pending_suggestions). Defaults were not lowered."
+                )
         else:
             lines.append("\nSuggestions only — call again with apply_changes=true to save.")
         return [types.TextContent(type="text", text="\n".join(lines))]
@@ -642,8 +710,6 @@ async def call_tool(name: str, arguments: dict):
         return [types.TextContent(type="text", text=text)]
 
     elif name == "generate_week":
-        from datetime import timedelta as _td
-
         plan = load_plan()
         if not plan:
             return [types.TextContent(type="text", text=(
@@ -665,9 +731,9 @@ async def call_tool(name: str, arguments: dict):
         target_km = float(target_km)
 
         today      = date.today()
-        week_start = today - _td(days=today.weekday()) + _td(weeks=week_offset)
+        week_start = today - timedelta(days=today.weekday()) + timedelta(weeks=week_offset)
 
-        created = generate_week_plan(plan, week_start, target_km, acwr)
+        created = generate_week_plan(plan, week_start, target_km, load_data)
 
         if not created:
             return [types.TextContent(type="text", text=(
@@ -677,9 +743,17 @@ async def call_tool(name: str, arguments: dict):
 
         lines = [
             f"WEEK GENERATED — w/c {week_start.isoformat()}",
-            f"Target volume: {target_km} km  |  ACWR: {acwr or 'N/A'}",
-            "",
+            f"Target volume: {target_km} km  |  Status: {load_data.get('training_status') or 'N/A'} (governs load)",
+            f"ACWR: {acwr or 'N/A'} — reference only, not a stop signal (runs high on multi-session days)",
         ]
+        try:
+            from db.history import assess_recent_feedback
+            fb = assess_recent_feedback()
+            if fb["backoff"]:
+                lines.append(f"⚠ Volume eased for logged feedback: {fb['reason']}.")
+        except Exception:
+            pass
+        lines.append("")
         for s in created:
             if s.get("error"):
                 lines.append(f"  {s['date']}  {s['workout_name']} — ERROR: {s['error']}")
@@ -689,7 +763,30 @@ async def call_tool(name: str, arguments: dict):
                     f"({s['planned_distance_km']} km)  ID: {s.get('garmin_workout_id')}"
                 )
         lines.append("\nAll sessions have been scheduled on your Garmin Connect calendar.")
+
+        # Auto-flag the week as planned so the morning coach skips creation
+        mark_week_planned(week_start.isoformat(), planned_by="generate_week")
+
         return [types.TextContent(type="text", text="\n".join(lines))]
+
+    elif name == "mark_week_planned":
+        week_start_str = _week_start_arg(arguments)
+        planned_by = (arguments or {}).get("planned_by", "manual")
+        mark_week_planned(week_start_str, planned_by=planned_by)
+        return [types.TextContent(type="text", text=f"Week of {week_start_str} marked as planned (by: {planned_by}).")]
+
+    elif name == "get_week_planned":
+        week_start_str = _week_start_arg(arguments)
+        result = is_week_planned(week_start_str)
+        if result["planned"]:
+            text = (
+                f"WEEK PLANNED: {result['week_start']}\n"
+                f"  Planned at: {result['planned_at']}\n"
+                f"  Planned by: {result['planned_by']}"
+            )
+        else:
+            text = f"NOT PLANNED: Week of {result['week_start']} has no plan flag."
+        return [types.TextContent(type="text", text=text)]
 
     elif name == "get_race_strategy":
         plan               = load_plan()
@@ -806,7 +903,10 @@ async def call_tool(name: str, arguments: dict):
                     icon   = "↓"
                     status = f"below default ({default_weight}kg → {w_logged}kg)"
 
-                if w_logged is not None:
+                # Ratchet: only write a default when the logged weight is at or above the current
+                # base (or the exercise is brand new). A lighter logged session — e.g. a sick/off
+                # day — is reported above but never lowers the stored default.
+                if w_logged is not None and (default_weight is None or w_logged >= default_weight):
                     to_update.append({
                         "name":                 default_name,
                         "weight_kg":            w_logged,
@@ -871,44 +971,48 @@ async def call_tool(name: str, arguments: dict):
 
         return [types.TextContent(type="text", text="\n".join(lines))]
 
-    elif name == "dump_morning_raw":
-        from datetime import timedelta as _td
-        client    = get_client()
-        today     = date.today().isoformat()
-        yesterday = (date.today() - _td(days=1)).isoformat()
+    elif name == "get_zones":
+        zones = get_zones()
+        source   = zones.get("_source", "unavailable")
+        lthr     = zones.get("_lthr")
+        lt_pace  = zones.get("_lt_pace_sec")
 
-        def _try(fn, *args, **kwargs):
-            try:
-                return fn(*args, **kwargs)
-            except Exception as e:
-                return {"_error": str(e)}
+        def _hr_str(z):
+            hr = zones.get(z, {}).get("hr")
+            return f"{hr[0]}–{hr[1]} bpm" if hr else "N/A"
 
-        raw = {
-            "hrv":                  _try(client.get_hrv_data, today),
-            "heart_rates":          _try(client.get_heart_rates, today),
-            "sleep":                _try(client.get_sleep_data, today),
-            "body_battery":         _try(client.get_body_battery, yesterday, today),
-            "stress":               _try(client.get_stress_data, yesterday),
-            "training_readiness":   _try(client.get_morning_training_readiness, today),
-        }
-        return [types.TextContent(type="text", text=json.dumps(raw, indent=2))]
+        def _pace_str(z):
+            p = zones.get(z, {}).get("pace")
+            return f"{fmt_pace(p[0])} – {fmt_pace(p[1])}" if p else "N/A"
 
-    elif name == "dump_strength_activity":
-        from datetime import timedelta as _td
-        client     = get_client()
-        act_id_arg = (arguments or {}).get("activity_id")
+        if source == "unavailable":
+            return [types.TextContent(
+                type="text",
+                text=(
+                    "ZONES — N/A\n\n"
+                    "Lactate threshold data not available from Garmin. "
+                    "Complete a Garmin LT test or ensure your device supports LT detection."
+                )
+            )]
 
-        if act_id_arg:
-            activity_id = int(act_id_arg)
-        else:
-            start = (date.today() - _td(days=30)).isoformat()
-            acts  = client.get_activities_by_date(start, activitytype="fitness_equipment")
-            if not acts:
-                return [types.TextContent(type="text", text="No fitness_equipment activities found in the last 30 days.")]
-            activity_id = int(acts[0]["activityId"])
-
-        raw = client.get_activity_exercise_sets(activity_id)
-        return [types.TextContent(type="text", text=json.dumps(raw, indent=2))]
+        lines = [
+            f"TRAINING ZONES — {date.today().strftime('%A %d %B %Y')}",
+            f"Source: Garmin lactate threshold",
+            f"LTHR: {lthr or 'N/A'} bpm   LT Pace: {fmt_pace(lt_pace)}",
+            "",
+            f"{'Zone':<12} {'HR Range':<20} {'Pace Range':<25} Notes",
+            "─" * 72,
+            f"{'Easy':<12} {_hr_str('easy'):<20} {_pace_str('easy'):<25} Z1–2, conversational",
+            f"{'Aerobic':<12} {_hr_str('aerobic'):<20} {_pace_str('aerobic'):<25} Z2–3, steady-state",
+            f"{'Threshold':<12} {_hr_str('threshold'):<20} {_pace_str('threshold'):<25} Z4, comfortably hard",
+            f"{'Interval':<12} {_hr_str('interval'):<20} {_pace_str('interval'):<25} Z5, VO2max",
+            "─" * 72,
+            "",
+            f"Easy HR ceiling: {zones.get('easy', {}).get('hr', [None, None])[1] or 'N/A'} bpm",
+            f"Threshold pace:  {fmt_pace(zones.get('threshold', {}).get('pace', [None])[0])} – "
+            f"{fmt_pace((zones.get('threshold', {}).get('pace') or [None, None])[1])}",
+        ]
+        return [types.TextContent(type="text", text="\n".join(lines))]
 
     else:
         raise ValueError(f"Unknown tool: {name}")
@@ -935,7 +1039,7 @@ if __name__ == "__main__":
         print("\n=== Training Load ===")
         load = fetch_training_load()
         print(load)
-        print(assess_acwr(load["acwr"]))
+        print(assess_training_state(load))
 
         print("\n=== Fitness Trend ===")
         for entry in fetch_fitness_trend():

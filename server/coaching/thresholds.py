@@ -10,10 +10,12 @@ def fetch_lactate_threshold() -> dict:
         client = get_client()
         raw = client.get_lactate_threshold(latest=True)
         shr = (raw or {}).get("speed_and_heart_rate") or {}
-        speed_ms = shr.get("speed")
+        speed_raw = shr.get("speed")
         lthr = shr.get("heartRate") or shr.get("hearRate")  # handle Garmin's historical typo
 
-        lt_pace_sec = round(1000 / speed_ms) if speed_ms and speed_ms > 0 else None
+        # Garmin's /latestLactateThreshold returns speed in sec/m (pace), not m/s.
+        # Convert: sec/m × 1000 m/km = sec/km.
+        lt_pace_sec = round(speed_raw * 1000) if speed_raw and speed_raw > 0 else None
 
         if lthr or lt_pace_sec:
             return {"lthr": lthr, "lt_pace_sec": lt_pace_sec, "source": "garmin_lt"}

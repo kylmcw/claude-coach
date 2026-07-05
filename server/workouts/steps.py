@@ -1,3 +1,5 @@
+import difflib
+
 from garminconnect.workout import (
     ExecutableStep,
     RepeatGroup,
@@ -116,8 +118,11 @@ def build_running_steps(steps: list[dict]) -> list:
 
         elif step_type in ("interval", "easy"):
             if "distance_meters" in step:
+                # NB: garminconnect's ConditionType.DISTANCE is 1, but Garmin's real
+                # conditionTypeId 1 is lap.button — sending it makes distance intervals
+                # render "until lap button". Distance is id 3. Hardcode like reps(10)/rest(8).
                 end_condition = {
-                    "conditionTypeId": ConditionType.DISTANCE,
+                    "conditionTypeId": 3,
                     "conditionTypeKey": "distance",
                     "displayOrder": 1,
                     "displayable": True,
@@ -173,15 +178,6 @@ def build_strength_steps(exercises: list[dict]) -> tuple[list, list[str]]:
     garmin_defaults = {d["garmin_exercise_name"]: d
                        for d in _raw_defaults if d.get("garmin_exercise_name")}
 
-    def _token_overlap(a: str, b: str) -> float:
-        """Jaccard similarity on word tokens (ignoring parentheses)."""
-        clean = str.maketrans("", "", "()")
-        ta = set(a.lower().translate(clean).split())
-        tb = set(b.lower().translate(clean).split())
-        if not ta or not tb:
-            return 0.0
-        return len(ta & tb) / len(ta | tb)
-
     def _find_default(exercise_name: str) -> dict:
         key = exercise_name.strip().lower()
 
@@ -194,14 +190,10 @@ def build_strength_steps(exercises: list[dict]) -> tuple[list, list[str]]:
         if g_name is not None and g_name in garmin_defaults:
             return garmin_defaults[g_name]
 
-        # 3. Token overlap on display names (Jaccard ≥ 0.5)
-        best, best_score = {}, 0.0
-        for stored_key, stored_val in all_defaults.items():
-            score = _token_overlap(key, stored_key)
-            if score > best_score:
-                best, best_score = stored_val, score
-        if best_score >= 0.5:
-            return best
+        # 3. Fuzzy match on display names
+        close = difflib.get_close_matches(key, all_defaults, n=1, cutoff=0.5)
+        if close:
+            return all_defaults[close[0]]
 
         return {}
 
@@ -214,11 +206,15 @@ def build_strength_steps(exercises: list[dict]) -> tuple[list, list[str]]:
         rest_secs  = float(ex.get("rest_seconds", 60))
         duration   = ex.get("duration_seconds")
 
-        # Merge defaults: explicit args take priority over stored defaults
+        # Merge defaults: explicit args take priority over stored defaults.
+        # Weight uses the EFFECTIVE value (base + any active override for today) so sick-week
+        # / deload overrides program the adjusted weight while the base default is untouched.
         default    = _find_default(name)
         sets       = int(ex.get("sets")  or default.get("sets")  or 3)
         reps       = ex.get("reps")      or default.get("reps")
-        weight_kg  = ex.get("weight_kg") or default.get("weight_kg")
+        weight_kg  = (ex.get("weight_kg")
+                      or default.get("effective_weight_kg")
+                      or default.get("weight_kg"))
 
         # Use pre-resolved Garmin mapping from defaults if available, else look up
         if default.get("garmin_category") and default.get("garmin_exercise_name"):

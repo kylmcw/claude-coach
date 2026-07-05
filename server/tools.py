@@ -219,6 +219,17 @@ def get_tool_definitions() -> list[types.Tool]:
             inputSchema={"type": "object", "properties": {}, "required": []}
         ),
         types.Tool(
+            name="get_zones",
+            description=(
+                "Fetch lactate threshold data from Garmin and derive personalised HR and pace zones. "
+                "Returns easy, aerobic, threshold, and interval zones with bpm ranges and pace ranges (sec/km). "
+                "Zones are derived from LTHR using Friel running coefficients. "
+                "Use this to get the actual easy HR ceiling, threshold pace, or any zone boundary "
+                "rather than relying on generic heuristics."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+        types.Tool(
             name="get_weekly_review",
             description=(
                 "Review the current week's training vs last week. "
@@ -536,6 +547,50 @@ def get_tool_definitions() -> list[types.Tool]:
             }
         ),
         types.Tool(
+            name="set_exercise_override",
+            description=(
+                "Temporarily adjust the PROGRAMMED weight for an exercise without changing its "
+                "stored base default. Use for a sick/deload week, a travel-gym week, or any period "
+                "you want lighter (or heavier) weights that auto-revert afterwards. "
+                "kind='pct' applies a signed percentage (e.g. value -20 = 20% lighter); "
+                "kind='delta' applies a signed kg change (e.g. value -10 = 10 kg lighter). "
+                "Optional start_date/end_date (YYYY-MM-DD) scope the window — outside it the "
+                "exercise reverts to its base weight automatically. Overrides do not stack: the "
+                "newest active override for an exercise wins. Tag with a label (e.g. 'sick') so you "
+                "can clear a whole batch at once."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name":       {"type": "string",  "description": "Exercise name (matches your defaults, e.g. 'Squat')"},
+                    "kind":       {"type": "string",  "enum": ["pct", "delta"], "description": "'pct' = percentage adjustment, 'delta' = kg adjustment"},
+                    "value":      {"type": "number",  "description": "Signed amount. Negative = lighter (e.g. -20 with pct, -10 with delta)."},
+                    "label":      {"type": "string",  "description": "Optional tag grouping related overrides (e.g. 'sick', 'deload', 'travel')"},
+                    "start_date": {"type": "string",  "description": "Optional YYYY-MM-DD start of the window. Open-ended if omitted."},
+                    "end_date":   {"type": "string",  "description": "Optional YYYY-MM-DD end of the window (inclusive). Open-ended if omitted."}
+                },
+                "required": ["name", "kind", "value"]
+            }
+        ),
+        types.Tool(
+            name="clear_exercise_override",
+            description=(
+                "Remove active exercise weight overrides, reverting programmed weights to their "
+                "base defaults. Specify exactly one of: name (clear overrides for one exercise), "
+                "label (clear all overrides with that tag, e.g. 'sick'), or all=true (clear every "
+                "active override). Overrides are deactivated, not deleted, so history is preserved."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name":  {"type": "string",  "description": "Clear active overrides for this exercise."},
+                    "label": {"type": "string",  "description": "Clear all active overrides carrying this label."},
+                    "all":   {"type": "boolean", "description": "If true, clear every active override."}
+                },
+                "required": []
+            }
+        ),
+        types.Tool(
             name="get_daily_briefing",
             description=(
                 "Single-call morning briefing: readiness (HRV, sleep, Training Readiness score → "
@@ -597,6 +652,45 @@ def get_tool_definitions() -> list[types.Tool]:
                         "type": "integer",
                         "description": "0 = this week (default), 1 = next week.",
                         "default": 0
+                    }
+                },
+                "required": []
+            }
+        ),
+        types.Tool(
+            name="mark_week_planned",
+            description=(
+                "Mark a week as fully planned in the DB so the Monday morning coach skips "
+                "workout creation for that week. Called automatically by generate_week; "
+                "also call manually after setting up a custom or deload week."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "week_start": {
+                        "type": "string",
+                        "description": "ISO date (YYYY-MM-DD) of the Monday that starts the week. Defaults to this week's Monday if omitted."
+                    },
+                    "planned_by": {
+                        "type": "string",
+                        "description": "Label for who/what planned the week (e.g. 'generate_week', 'manual'). Defaults to 'manual'."
+                    }
+                },
+                "required": []
+            }
+        ),
+        types.Tool(
+            name="get_week_planned",
+            description=(
+                "Check whether a week has been marked as planned in the DB. "
+                "Returns planned (bool), week_start, planned_at, and planned_by."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "week_start": {
+                        "type": "string",
+                        "description": "ISO date (YYYY-MM-DD) of the Monday that starts the week. Defaults to this week's Monday if omitted."
                     }
                 },
                 "required": []
@@ -701,36 +795,6 @@ def get_tool_definitions() -> list[types.Tool]:
                             "If true, save logged weights as new defaults for all fully-completed exercises. "
                             "Defaults to false (review only)."
                         )
-                    }
-                },
-                "required": []
-            }
-        ),
-        types.Tool(
-            name="dump_morning_raw",
-            description=(
-                "Diagnostic tool. Dumps the raw API responses for HRV, heart rate, sleep, "
-                "body battery, stress, and training readiness for today — as returned directly "
-                "by Garmin Connect, before any parsing. Use when any morning metric shows null "
-                "to identify the exact structure the API is returning."
-            ),
-            inputSchema={"type": "object", "properties": {}, "required": []}
-        ),
-        types.Tool(
-            name="dump_strength_activity",
-            description=(
-                "Diagnostic tool. Fetches the raw exerciseSets payload from Garmin Connect "
-                "for a completed strength/gym activity. Used to inspect the exact structure "
-                "Garmin returns (exercise names, sets, reps, weights) before building "
-                "automated default-update logic. If no activity_id is given, uses the most "
-                "recent fitness_equipment activity in the last 30 days."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "activity_id": {
-                        "type": "integer",
-                        "description": "Garmin activity ID to inspect. If omitted, the most recent strength activity is used."
                     }
                 },
                 "required": []

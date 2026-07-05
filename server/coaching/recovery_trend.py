@@ -42,8 +42,13 @@ def fetch_recovery_trend(days: int = 14) -> list[dict]:
             if sleep_raw:
                 scores = sleep_raw.get("sleepScores") or {}
                 dto    = sleep_raw.get("dailySleepDTO") or {}
-                score  = (scores.get("overall") or scores.get("totalScore")
-                          or dto.get("sleepScores", {}).get("overall"))
+                score_raw = (scores.get("overall") or scores.get("totalScore")
+                             or dto.get("sleepScores", {}).get("overall"))
+                # Garmin sometimes returns a dict {"value": 72, ...} instead of a plain int
+                if isinstance(score_raw, dict):
+                    score = score_raw.get("value") or score_raw.get("score")
+                else:
+                    score = score_raw
                 entry["sleep_score"] = score
                 # Total hours as fallback
                 start = dto.get("sleepStartTimestampGMT")
@@ -101,10 +106,10 @@ def analyze_recovery_trend(series: list[dict]) -> dict:
     """
     hrv_low, _, rhr_norm = load_baselines()
 
-    hrv_vals = [e["hrv"]         for e in series if e.get("hrv")         is not None]
-    rhr_vals = [e["rhr"]         for e in series if e.get("rhr")         is not None]
-    bb_vals  = [e["body_battery"]for e in series if e.get("body_battery")is not None]
-    ss_vals  = [e["sleep_score"] for e in series if e.get("sleep_score") is not None]
+    hrv_vals = [e["hrv"]          for e in series if isinstance(e.get("hrv"),          (int, float))]
+    rhr_vals = [e["rhr"]          for e in series if isinstance(e.get("rhr"),          (int, float))]
+    bb_vals  = [e["body_battery"] for e in series if isinstance(e.get("body_battery"), (int, float))]
+    ss_vals  = [e["sleep_score"]  for e in series if isinstance(e.get("sleep_score"),  (int, float))]
 
     def _dir(vals: list[float], positive_is_good: bool = True) -> str:
         if len(vals) < 3:

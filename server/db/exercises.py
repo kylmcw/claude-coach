@@ -152,6 +152,17 @@ def _create_exercise_tables(conn: sqlite3.Connection) -> None:
             weight_kg            REAL,
             fully_completed      INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS exercise_overrides (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            kind        TEXT NOT NULL,          -- 'pct' | 'delta'
+            value       REAL NOT NULL,
+            label       TEXT,
+            start_date  TEXT,
+            end_date    TEXT,
+            active      INTEGER NOT NULL DEFAULT 1,
+            created_at  TEXT NOT NULL
+        );
     """)
     conn.commit()
     _seed_garmin_exercises(conn)
@@ -230,6 +241,22 @@ def _round_weight(weight_kg: float, increasing: bool) -> float:
         return math.floor(units) * 2.5
 
 
+def _round_to_plate(weight_kg: float) -> float:
+    """Round to the nearest 2.5 kg plate increment (non-directional)."""
+    return round(round(weight_kg / 2.5, 6)) * 2.5
+
+
+def _apply_override(base_kg: float, kind: str, value: float) -> float:
+    """Apply an override to a base weight and snap to the nearest plate.
+
+    kind='pct'   → base * (1 + value/100)   (value is a signed percent, e.g. -20)
+    kind='delta' → base + value             (value is a signed kg delta, e.g. -10)
+    """
+    if kind == "pct":
+        return _round_to_plate(base_kg * (1 + value / 100.0))
+    return _round_to_plate(base_kg + value)
+
+
 def set_exercise_defaults(exercises: list[dict]) -> list[str]:
     """
     Upsert default weight/sets/reps for one or more exercises.
@@ -287,8 +314,34 @@ def set_exercise_defaults(exercises: list[dict]) -> list[str]:
     return results
 
 
-def get_exercise_defaults(name: str | None = None) -> list[dict]:
-    """Return all exercise defaults, or a specific one if name is given."""
+def _active_override_row(conn: sqlite3.Connection, name: str, on_date: str) -> dict | None:
+    """Return the newest active override for `name` whose window contains `on_date`, else None.
+
+    No stacking — when several overrides are active for one exercise, the most recently
+    created (highest id) wins. The window is inclusive; NULL start/end means open-ended.
+    """
+    row = conn.execute(
+        """SELECT id, name, kind, value, label, start_date, end_date, active
+             FROM exercise_overrides
+            WHERE name = ? AND active = 1
+              AND (start_date IS NULL OR start_date <= ?)
+              AND (end_date   IS NULL OR end_date   >= ?)
+            ORDER BY id DESC
+            LIMIT 1""",
+        (name, on_date, on_date),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_exercise_defaults(name: str | None = None, on_date: str | None = None) -> list[dict]:
+    """Return all exercise defaults, or a specific one if name is given.
+
+    Each row gains two derived fields:
+      active_override     – the override dict in effect on `on_date` (today by default), or None
+      effective_weight_kg – base weight with the active override applied; equals weight_kg when
+                            no override is active. This is the weight to program for the session.
+    """
+    today = on_date or date.today().isoformat()
     conn = sqlite3.connect(HISTORY_DB)
     conn.row_factory = sqlite3.Row
     try:
@@ -300,7 +353,106 @@ def get_exercise_defaults(name: str | None = None) -> list[dict]:
             rows = conn.execute(
                 "SELECT * FROM exercise_defaults ORDER BY name"
             ).fetchall()
-        return [dict(r) for r in rows]
+
+        result = []
+        for r in rows:
+            d = dict(r)
+            base = d.get("weight_kg")
+            override = _active_override_row(conn, d["name"], today)
+            if override is not None and base is not None:
+                d["effective_weight_kg"] = _apply_override(
+                    float(base), override["kind"], float(override["value"])
+                )
+            else:
+                d["effective_weight_kg"] = base
+            d["active_override"] = override
+            result.append(d)
+        return result
+    finally:
+        conn.close()
+
+
+def set_exercise_override(
+    name: str,
+    kind: str,
+    value: float,
+    label: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict:
+    """Create an interchangeable override on an exercise's programmed weight.
+
+    Modifies the weight a session is built with WITHOUT touching the stored base default —
+    when the window passes (or the override is cleared) the programmed weight reverts to base.
+
+    kind='pct'   → effective = base * (1 + value/100)   (value signed, e.g. -20 for a sick week)
+    kind='delta' → effective = base + value             (value signed kg)
+
+    No stacking — the newest active override for an exercise wins. Returns a summary dict
+    including the resolved effective weight for `start_date` (or today).
+    """
+    kind = kind.strip().lower()
+    if kind not in ("pct", "delta"):
+        raise ValueError(f"override kind must be 'pct' or 'delta', got '{kind}'")
+    name = name.strip()
+    today = date.today().isoformat()
+    conn = sqlite3.connect(HISTORY_DB)
+    try:
+        conn.execute(
+            """INSERT INTO exercise_overrides
+                   (name, kind, value, label, start_date, end_date, active, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 1, ?)""",
+            (name, kind, float(value), label, start_date, end_date, today),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Resolve the effective weight for the window start (or today) for the confirmation message.
+    ref_date = start_date or today
+    rows = get_exercise_defaults(name, on_date=ref_date)
+    base      = rows[0]["weight_kg"]            if rows else None
+    effective = rows[0]["effective_weight_kg"]  if rows else None
+    return {
+        "name":       name,
+        "kind":       kind,
+        "value":      float(value),
+        "label":      label,
+        "start_date": start_date,
+        "end_date":   end_date,
+        "base_kg":    base,
+        "effective_kg": effective,
+    }
+
+
+def clear_exercise_override(
+    name: str | None = None,
+    label: str | None = None,
+    clear_all: bool = False,
+) -> int:
+    """Deactivate active overrides. Returns the number cleared.
+
+    Specify exactly one selector: clear_all=True (all), label=..., or name=...
+    Rows are soft-deactivated (active=0) so the override history is preserved.
+    """
+    conn = sqlite3.connect(HISTORY_DB)
+    try:
+        if clear_all:
+            cur = conn.execute("UPDATE exercise_overrides SET active = 0 WHERE active = 1")
+        elif label:
+            cur = conn.execute(
+                "UPDATE exercise_overrides SET active = 0 WHERE active = 1 AND label = ?",
+                (label,),
+            )
+        elif name:
+            cur = conn.execute(
+                "UPDATE exercise_overrides SET active = 0 WHERE active = 1 AND name = ?",
+                (name.strip(),),
+            )
+        else:
+            raise ValueError("clear_exercise_override needs one of: name, label, or clear_all=True")
+        conn.commit()
+        return cur.rowcount
     finally:
         conn.close()
 
@@ -344,32 +496,37 @@ def log_strength_progress(
 
             current_kg = float(row[0])
             if completed:
-                raw_new    = current_kg * 1.10
-                new_kg     = _round_weight(raw_new, increasing=True)
-                outcome    = "completed"
-                action     = f"+10% → {new_kg}kg"
+                # Ratchet up: a completed session raises the stored default.
+                new_kg = _round_weight(current_kg * 1.10, increasing=True)
+                suggestions.append({
+                    "exercise":     name,
+                    "outcome":      "completed",
+                    "current_kg":   current_kg,
+                    "suggested_kg": new_kg,
+                    "action":       f"+10% → {new_kg}kg",
+                    "needs_review": False,
+                    "notes":        notes,
+                })
+                if apply_changes:
+                    conn.execute(
+                        """UPDATE exercise_defaults
+                              SET weight_kg = ?, last_updated = ?, notes = COALESCE(?, notes)
+                            WHERE name = ?""",
+                        (new_kg, today, notes or None, name),
+                    )
             else:
-                raw_new    = current_kg * 0.90
-                new_kg     = _round_weight(raw_new, increasing=False)
-                outcome    = "failed"
-                action     = f"-10% → {new_kg}kg"
-
-            suggestions.append({
-                "exercise":     name,
-                "outcome":      outcome,
-                "current_kg":   current_kg,
-                "suggested_kg": new_kg,
-                "action":       action,
-                "notes":        notes,
-            })
-
-            if apply_changes:
-                conn.execute(
-                    """UPDATE exercise_defaults
-                          SET weight_kg = ?, last_updated = ?, notes = COALESCE(?, notes)
-                        WHERE name = ?""",
-                    (new_kg, today, notes or None, name),
-                )
+                # Ratchet guarantee: a failed/off session NEVER silently lowers the stored
+                # default (sick days were corrupting base capacity). Flag for explicit review
+                # instead — the dispatcher logs a pending coach suggestion. Default unchanged.
+                suggestions.append({
+                    "exercise":     name,
+                    "outcome":      "failed",
+                    "current_kg":   current_kg,
+                    "suggested_kg": None,
+                    "action":       f"held at {current_kg}kg (default not lowered — logged for review)",
+                    "needs_review": True,
+                    "notes":        notes,
+                })
 
         if apply_changes:
             conn.commit()

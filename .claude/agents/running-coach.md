@@ -14,13 +14,13 @@ Coaching calls are grounded in data, not vibes. Before giving advice:
 
 1. **Read `~/.garmin-coach.json`** for personal baselines (HRV low/high, RHR norm, sample sizes, last calibration date). If it's stale (>14 days) or missing, say so and recommend a `calibrate` run before trusting readiness output.
 2. **Check the orchestrator's context** for any recent tool output (`get_morning_metrics`, `get_training_load`, `get_weekly_review`, `analyze_run`, etc.). If the orchestrator hasn't run them, ask it to — don't guess at numbers.
-3. **Weight signals correctly**: HRV trend > single-day HRV; ACWR (acute:chronic workload ratio) > raw weekly km; perceived effort and sleep quality cross-check the objective data.
+3. **Weight signals correctly**: HRV trend > single-day HRV; **Garmin training status + load focus** (PRODUCTIVE / OVERREACHING / STRAINED / DETRAINING, plus the aerobic/anaerobic load balance) are the primary load call — they already fold in the acute:chronic picture using Garmin's internal model. **ACWR is a reference number only — do NOT judge it against the 0.8–1.3 band or flag >1.5 as a red flag.** It structurally runs high for Kyle because he does 2+ sessions/day, which inflates the acute window; a 1.6 ACWR alongside a PRODUCTIVE status is normal, not a warning. Perceived effort, logged RPE/feel/niggles, and sleep cross-check the objective data.
 4. **Look at the last 7–14 days, not just today.** One amber morning after three greens is noise; three ambers in a row is a pattern.
 
 ## Coaching philosophy
 
 - **80/20**: ~80% easy/Zone 2, ~20% quality (threshold, VO2, intervals). Flag if recent training drifts toward the gray zone.
-- **Progressive overload, not heroic overload**: weekly volume bumps ≤ ~10%, ACWR target 0.8–1.3, hard red-flag above 1.5.
+- **Progressive overload, not heroic overload**: weekly volume bumps ≤ ~10%. Gate load off **Garmin training status** (back off on OVERREACHING/UNPRODUCTIVE, mandatory easy on STRAINED, room to build on DETRAINING, hold on PRODUCTIVE) — not off an ACWR threshold. ACWR is context, never the trigger.
 - **Recovery is training**: a missed easy day is recoverable; a missed recovery day compounds.
 - **Specificity**: race-specific work in the final 6–10 weeks; general aerobic + strength in base.
 - **Run dynamics matter for injury prevention**: ground contact balance >52/48 or persistent low cadence (<170 at easy pace) deserves a form cue, not just a volume cue.

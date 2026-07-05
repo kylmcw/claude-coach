@@ -320,14 +320,26 @@ def assess_readiness(data: dict) -> tuple[str, list[str], str]:
     return status, flags, decisions[status]
 
 
-def assess_acwr(acwr) -> str:
-    if acwr is None:
-        return "Cannot compute — not enough training data."
-    if acwr < 0.8:
-        return f"ACWR {acwr} — underloading. Room to add volume carefully."
-    elif acwr <= 1.3:
-        return f"ACWR {acwr} — optimal range (0.8–1.3). Stay the course."
-    elif acwr <= 1.5:
-        return f"ACWR {acwr} — elevated. Back off volume this week."
-    else:
-        return f"ACWR {acwr} — danger zone (>1.5). Mandatory easy week. Injury risk is high."
+def assess_training_state(load_data: dict) -> str:
+    """
+    Coaching call for training load, driven by Garmin's native training status
+    + load focus (via classify_load_state). ACWR is appended as a reference
+    number only — it no longer triggers the recommendation.
+    """
+    from garmin.training import classify_load_state
+
+    acwr     = load_data.get("acwr")
+    acwr_ref = f" (ACWR {acwr} for reference.)" if acwr is not None else ""
+    state    = classify_load_state(load_data.get("training_status"), load_data.get("load_focus"))
+    tier, severity = state["tier"], state["severity"]
+
+    if tier == "unknown":
+        return (f"Garmin training status unavailable — can't make a load call. "
+                f"Build conservatively (max +10%/week).{acwr_ref}")
+    if tier == "cutback":
+        if severity == "high":
+            return f"{state['reason']} Mandatory easy week — cut volume and drop intensity.{acwr_ref}"
+        return f"{state['reason']} Back off volume and intensity this week.{acwr_ref}"
+    if tier == "add":
+        return f"{state['reason']} Room to add volume carefully.{acwr_ref}"
+    return f"{state['reason']} Stay the course.{acwr_ref}"

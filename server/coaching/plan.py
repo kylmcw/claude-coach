@@ -332,9 +332,10 @@ def plan_week_sessions(
     plan: dict,
     week_start: date,
     target_km: float,
-    acwr: float | None,
+    load_data: dict | None,
 ) -> list[dict]:
     from coaching.thresholds import get_zones
+    from garmin.training import classify_load_state
 
     today       = date.today()
     race_date   = date.fromisoformat(plan["race_date"])
@@ -347,10 +348,23 @@ def plan_week_sessions(
     run_days  = plan.get("run_days_per_week", 3)
     blocked   = {d.lower() for d in (plan.get("blocked_days") or [])}
 
-    if acwr is not None and acwr > 1.3:
-        target_km = round(target_km * 0.80, 1)
-    elif acwr is not None and acwr < 0.8 and target_km > 0:
+    # Scale volume off Garmin's native training status + load focus, not ACWR.
+    # unknown/hold → leave target as-is (conservative: no inflation on no signal).
+    state = classify_load_state((load_data or {}).get("training_status"),
+                                (load_data or {}).get("load_focus"))
+    if state["tier"] == "cutback":
+        target_km = round(target_km * (0.65 if state["severity"] == "high" else 0.80), 1)
+    elif state["tier"] == "add" and target_km > 0:
         target_km = round(target_km * 1.10, 1)
+
+    # Logged feedback overrides "looks fine" Garmin load: a recurring niggle or
+    # a high-RPE/rough-feel trend forces a back-off regardless of the tier above.
+    try:
+        from db.history import assess_recent_feedback
+        if assess_recent_feedback()["backoff"]:
+            target_km = round(target_km * 0.85, 1)
+    except Exception:
+        pass
 
     if phase == "Taper":
         target_km = round(target_km * 0.60, 1)
@@ -382,7 +396,13 @@ def plan_week_sessions(
     sessions: list[dict] = []
     n = len(run_slots)
 
-    long_km   = round(target_km * 0.30, 1)
+    # Long run must always be the biggest single session of the week. A fixed
+    # 30% split only holds once there are >=4 run days (1/n <= 0.25 < 0.30);
+    # with n<=3 an equal split alone already exceeds 30%, so the fixed fraction
+    # under-sizes the long run relative to the other days. Use whichever
+    # fraction is larger, with a small buffer over the equal-split floor.
+    long_frac = max(0.30, (1 / n) + 0.05) if n > 0 else 0.30
+    long_km   = round(target_km * long_frac, 1)
     other_km  = round((target_km - long_km) / max(n - 1, 1), 1) if n > 1 else target_km
 
     def _easy_steps(km: float) -> list[dict]:

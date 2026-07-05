@@ -63,20 +63,48 @@ def fetch_training_load() -> dict:
     if training_status:
         # Training status structure varies by firmware; try common key paths
         ts = training_status
-        if isinstance(ts, list) and ts:
-            ts = ts[0]
+        if isinstance(ts, list):
+            ts = ts[0] if ts else {}
+        if not isinstance(ts, dict):
+            ts = {}
 
         status_label  = (ts.get("trainingStatusPhase")
-                         or ts.get("trainingStatus")
                          or ts.get("latestTrainingStatus"))
         training_load = ts.get("trainingLoad") or ts.get("trainingLoad7Day")
 
         garmin_acute_load   = ts.get("acuteLoad") or ts.get("acuteTrainingLoad")
         garmin_chronic_load = ts.get("chronicLoad") or ts.get("chronicTrainingLoad")
         garmin_load_ratio   = ts.get("loadRatio") or ts.get("acuteChronicRatio")
-
-        # Load focus: e.g. "LOW_AEROBIC_DEFICIT" / "HIGH_AEROBIC_SURPLUS" / "ANAEROBIC_SURPLUS"
         load_focus = ts.get("loadFocus") or ts.get("trainingLoadBalance") or ts.get("loadFocusReason")
+
+        # Real metrics-service response nests the human-readable phrases a couple
+        # of levels down, keyed by device id. Dig them out (verified 2026-07-05
+        # against a live Forerunner 965). The numeric `trainingStatus` code does
+        # NOT match the phrase (saw code 7 with "PRODUCTIVE_6"), so prefer the
+        # phrase string and never fall back to the raw int.
+        def _first_device(dto_map):
+            if isinstance(dto_map, dict):
+                for v in dto_map.values():
+                    if isinstance(v, dict):
+                        return v
+            return {}
+
+        status_dev = _first_device((ts.get("mostRecentTrainingStatus") or {})
+                                   .get("latestTrainingStatusData"))
+        if not status_label:
+            status_label = status_dev.get("trainingStatusFeedbackPhrase")
+        acute_dto = status_dev.get("acuteTrainingLoadDTO") or {}
+        garmin_acute_load   = garmin_acute_load   or acute_dto.get("dailyTrainingLoadAcute")
+        garmin_chronic_load = garmin_chronic_load or acute_dto.get("dailyTrainingLoadChronic")
+        # Real ACWR ratio is dailyAcuteChronicWorkloadRatio (1.6), NOT acwrPercent
+        # (a load-tunnel position %). Confirmed live.
+        if garmin_load_ratio is None:
+            garmin_load_ratio = acute_dto.get("dailyAcuteChronicWorkloadRatio")
+
+        balance_dev = _first_device((ts.get("mostRecentTrainingLoadBalance") or {})
+                                    .get("metricsTrainingLoadBalanceDTOMap"))
+        if not load_focus:
+            load_focus = balance_dev.get("trainingBalanceFeedbackPhrase")
 
     # Prefer Garmin native ACWR when available (more accurate as it uses their internal load model)
     effective_acwr = None
@@ -222,33 +250,11 @@ def fetch_weekly_zone_distribution(activities: list[dict]) -> dict:
     }
 
 
-def _scan_niggle_patterns(limit: int = 60) -> list[str]:
-    """
-    Scan recent feedback rows for recurring niggle keywords.
-    Returns a list of warning strings for any body part mentioned 3+ times in 2 weeks.
-    Uses limit=60 rows (not 14) so the 14-day window is fully covered even with sparse logging.
-    """
+def _feedback_review_lines() -> list[str]:
+    """Recent RPE/feel/niggle review lines via db.history.assess_recent_feedback (lazy — avoids import cycle)."""
     try:
-        from db.history import fetch_workout_history
-        from datetime import date as _date, timedelta as _td
-        cutoff = (_date.today() - _td(days=14)).isoformat()
-        rows = fetch_workout_history(limit=limit, current_cycle_only=False)
-        rows = [r for r in rows if (r.get("date") or "") >= cutoff]
-        keyword_counts: dict[str, int] = {}
-        for r in rows:
-            niggle = (r.get("niggles") or "").lower()
-            if not niggle:
-                continue
-            for keyword in ("calf", "achilles", "knee", "hip", "hamstring",
-                            "shin", "ankle", "foot", "plantar", "it band",
-                            "quad", "glute", "back", "shoulder", "arm"):
-                if keyword in niggle:
-                    keyword_counts[keyword] = keyword_counts.get(keyword, 0) + 1
-        return [
-            f"RECURRING NIGGLE: '{kw}' mentioned {n}x in recent history — "
-            "monitor closely and consider reducing load or seeking assessment."
-            for kw, n in keyword_counts.items() if n >= 3
-        ]
+        from db.history import assess_recent_feedback
+        return assess_recent_feedback()["lines"]
     except Exception:
         return []
 
@@ -482,54 +488,59 @@ def generate_week_suggestions(
 
     vol_delta_pct = round((vol_this - vol_last) / vol_last * 100, 1) if vol_last > 0 else None
 
+    # Drive the decision off Garmin's native training status + load focus.
+    # ACWR is appended to the rationale as a reference number only.
+    state = classify_load_state(load_data.get("training_status"), load_data.get("load_focus"))
+    tier, severity = state["tier"], state["severity"]
+    acwr_ref = f" (ACWR {acwr} shown for reference.)" if acwr is not None else ""
+
     # ── 1. Volume / load ──────────────────────────────────────────────────
-    if acwr is not None:
-        if acwr > 1.5:
-            target = round(vol_this * 0.65, 1)
-            suggestions.append({
-                "recommendation": f"Mandatory easy week — cap total running at ~{target} km, no intensity.",
-                "rationale": f"ACWR is {acwr}, well above the 1.3 danger threshold. Continuing to load raises injury risk significantly.",
-                "action_type": "adjust_volume",
-            })
-        elif acwr > 1.3:
-            target = round(vol_this * 0.80, 1)
-            suggestions.append({
-                "recommendation": f"Back off — aim for ~{target} km at easy effort only this week.",
-                "rationale": f"ACWR at {acwr} is above the optimal 0.8–1.3 range. A lighter week lets you absorb load without accumulating fatigue.",
-                "action_type": "adjust_volume",
-            })
-        elif acwr < 0.8 and vol_delta_pct is not None and vol_delta_pct < -20:
-            target = round(vol_this * 1.10, 1)
-            suggestions.append({
-                "recommendation": f"Safe to rebuild — target ~{target} km, adding one easy session back in.",
-                "rationale": f"Volume dropped {abs(vol_delta_pct):.0f}% and ACWR is low at {acwr}. The body has absorbed the load; time to progress.",
-                "action_type": "add_session",
-            })
-        elif acwr < 0.8:
-            base = vol_this or vol_last or 30
-            target = round(base * 1.10, 1)
-            suggestions.append({
-                "recommendation": f"Underloading — room to add ~10% volume or an extra easy run (target ~{target} km).",
-                "rationale": f"ACWR at {acwr} is below optimal range. You have capacity to absorb more load safely.",
-                "action_type": "add_session",
-            })
-        elif vol_delta_pct is not None and vol_delta_pct > 15:
-            suggestions.append({
-                "recommendation": "Hold volume steady this week before building further.",
-                "rationale": f"Volume jumped {vol_delta_pct:+.0f}% last week. Let connective tissue catch up before adding more.",
-                "action_type": "adjust_volume",
-            })
-        else:
-            suggestions.append({
-                "recommendation": "Load is optimal — execute your planned block as written.",
-                "rationale": f"ACWR at {acwr} is in the optimal 0.8–1.3 range. No adjustment needed.",
-                "action_type": "note_only",
-            })
-    else:
+    if tier == "cutback" and severity == "high":
+        target = round(vol_this * 0.65, 1)
         suggestions.append({
-            "recommendation": "Build gradually — no ACWR data yet, so increase volume by no more than 10% per week.",
-            "rationale": "Insufficient history to compute ACWR. Conservative progression is the safest default.",
+            "recommendation": f"Mandatory easy week — cap total running at ~{target} km, no intensity.",
+            "rationale": f"{state['reason']} Continuing to load raises injury risk significantly.{acwr_ref}",
             "action_type": "adjust_volume",
+        })
+    elif tier == "cutback":
+        target = round(vol_this * 0.80, 1)
+        suggestions.append({
+            "recommendation": f"Back off — aim for ~{target} km at easy effort only this week.",
+            "rationale": f"{state['reason']} A lighter week lets you absorb load without accumulating fatigue.{acwr_ref}",
+            "action_type": "adjust_volume",
+        })
+    elif tier == "add" and vol_delta_pct is not None and vol_delta_pct < -20:
+        target = round(vol_this * 1.10, 1)
+        suggestions.append({
+            "recommendation": f"Safe to rebuild — target ~{target} km, adding one easy session back in.",
+            "rationale": f"Volume dropped {abs(vol_delta_pct):.0f}%. {state['reason']} The body has absorbed the load; time to progress.{acwr_ref}",
+            "action_type": "add_session",
+        })
+    elif tier == "add":
+        base = vol_this or vol_last or 30
+        target = round(base * 1.10, 1)
+        suggestions.append({
+            "recommendation": f"Underloading — room to add ~10% volume or an extra easy run (target ~{target} km).",
+            "rationale": f"{state['reason']} You have capacity to absorb more load safely.{acwr_ref}",
+            "action_type": "add_session",
+        })
+    elif tier == "unknown":
+        suggestions.append({
+            "recommendation": "Build gradually — no Garmin training-status signal yet, so increase volume by no more than 10% per week.",
+            "rationale": f"{state['reason']} Conservative progression is the safest default.{acwr_ref}",
+            "action_type": "adjust_volume",
+        })
+    elif vol_delta_pct is not None and vol_delta_pct > 15:
+        suggestions.append({
+            "recommendation": "Hold volume steady this week before building further.",
+            "rationale": f"Volume jumped {vol_delta_pct:+.0f}% last week. {state['reason']} Let connective tissue catch up before adding more.{acwr_ref}",
+            "action_type": "adjust_volume",
+        })
+    else:  # hold
+        suggestions.append({
+            "recommendation": "Load is productive — execute your planned block as written.",
+            "rationale": f"{state['reason']} No adjustment needed.{acwr_ref}",
+            "action_type": "note_only",
         })
 
     # ── 2. Consistency ────────────────────────────────────────────────────
@@ -539,33 +550,40 @@ def generate_week_suggestions(
             "rationale": f"Only {sessions} session{'s' if sessions != 1 else ''} logged this week. Consistency beats intensity at this stage.",
             "action_type": "add_session",
         })
-    elif acwr is not None and 0.8 <= acwr <= 1.2:
-        # Healthy load + consistent sessions — suggest one quality session
+    elif tier == "hold":
+        # Productive load + consistent sessions — suggest one quality session
         suggestions.append({
             "recommendation": "Include one threshold session this week: 20–30 min at comfortably hard effort (RPE 7–8).",
-            "rationale": "Load is healthy and base is consistent. One quality session per week is enough stimulus to drive aerobic adaptation.",
+            "rationale": "Load is productive and base is consistent. One quality session per week is enough stimulus to drive aerobic adaptation.",
             "action_type": "add_quality",
         })
 
     return suggestions[:3]
 
 
-def _week_recommendation(acwr, vol_delta_pct: float | None) -> str:
-    """Plain-English recommendation for the coming week based on ACWR and volume delta."""
-    if acwr is None:
-        return "Not enough data for a load recommendation — build gradually."
-    if acwr > 1.5:
-        return "MANDATORY EASY WEEK. ACWR in danger zone — cut volume 30–40%, no intensity."
-    if acwr > 1.3:
-        return "Back off. ACWR elevated — reduce volume ~20% and keep effort easy."
-    if acwr < 0.8:
+def _week_recommendation(load_data: dict, vol_delta_pct: float | None) -> str:
+    """
+    Plain-English recommendation for the coming week, driven by Garmin's native
+    training status + load focus (not the raw ACWR ratio). ACWR is shown as a
+    reference figure elsewhere in the review.
+    """
+    state = classify_load_state(load_data.get("training_status"), load_data.get("load_focus"))
+    tier, severity = state["tier"], state["severity"]
+
+    if tier == "unknown":
+        return f"Not enough Garmin training-status data for a load call — build gradually. ({state['reason']})"
+    if tier == "cutback":
+        if severity == "high":
+            return f"MANDATORY EASY WEEK. {state['reason']} Cut volume 30–40%, no intensity."
+        return f"Back off. {state['reason']} Reduce volume ~20% and keep effort easy."
+    if tier == "add":
         if vol_delta_pct is not None and vol_delta_pct < -20:
-            return "Volume dropped significantly. Safe to rebuild — add ~10% this week."
-        return "Underloading. Room to add ~10% volume or one extra easy session."
-    # Optimal range (0.8–1.3)
+            return f"Volume dropped significantly. Safe to rebuild — add ~10% this week. ({state['reason']})"
+        return f"Room to build. {state['reason']} Add ~10% volume or one extra easy session."
+    # hold
     if vol_delta_pct is not None and vol_delta_pct > 15:
-        return "Big volume jump this week. Hold steady next week before building again."
-    return "Load is optimal. Stay the course — execute your next planned block."
+        return f"Big volume jump this week. Hold steady next week before building again. ({state['reason']})"
+    return f"Stay the course — execute your next planned block. ({state['reason']})"
 
 
 def _delta_str(a, b, unit="", decimals=1) -> str:
@@ -590,6 +608,71 @@ def _fmt_load_focus(focus: str | None) -> str:
     return labels.get(focus.upper(), focus)
 
 
+def classify_load_state(training_status: str | None, load_focus: str | None) -> dict:
+    """
+    Map Garmin's native training status + load-focus phrases onto a coaching
+    action tier. This is what drives cut-back / hold / add-volume decisions —
+    the raw ACWR ratio is now shown as a reference number only.
+
+    Returns {"tier", "severity", "reason"}:
+      tier     — "cutback" | "hold" | "add" | "unknown"
+      severity — "high" | "moderate" | None (only meaningful for cutback/add)
+
+    Matches on keywords, not exact enums: Garmin suffixes its phrases
+    ("PRODUCTIVE_6", "OVERREACHING_2", "AEROBIC_LOW_SHORTAGE") and the set
+    varies by firmware. Verified 2026-07-05 against a live Forerunner 965:
+    status "PRODUCTIVE_6", load focus "AEROBIC_LOW_FOCUS".
+    """
+    ts = (training_status or "").upper()
+    lf = (load_focus or "").upper()
+
+    if not ts and not lf:
+        return {"tier": "unknown", "severity": None,
+                "reason": "Garmin returned no training status or load focus (insufficient data)."}
+
+    # Load-focus signals. Note "ANAEROBIC" contains "AEROBIC" as a substring,
+    # so detect anaerobic first and exclude it from the aerobic check.
+    anaerobic = "ANAEROBIC" in lf
+    aerobic   = ("AEROBIC" in lf) and not anaerobic
+    anaerobic_excess = anaerobic and ("SURPLUS" in lf or "EXCESS" in lf or "FOCUS" in lf)
+    aerobic_shortage = aerobic and ("SHORTAGE" in lf or "DEFICIT" in lf)
+
+    # ── Training status = total-load trend → primary volume tier ──
+    # Check UNPRODUCTIVE before PRODUCTIVE (substring overlap).
+    if "STRAINED" in ts:
+        return {"tier": "cutback", "severity": "high",
+                "reason": f"Training status '{training_status}' — sustained overload with fitness declining."}
+    if "OVERREACH" in ts or "UNPRODUCTIVE" in ts:
+        return {"tier": "cutback", "severity": "moderate",
+                "reason": f"Training status '{training_status}' — load is outpacing recovery."}
+    if "DETRAINING" in ts:
+        return {"tier": "add", "severity": "moderate",
+                "reason": f"Training status '{training_status}' — load has dropped and fitness is fading."}
+
+    productive = ("PRODUCTIVE" in ts or "PEAKING" in ts
+                  or "MAINTAINING" in ts or "RECOVERY" in ts)
+    if productive:
+        if anaerobic_excess:
+            return {"tier": "cutback", "severity": "moderate",
+                    "reason": f"Status '{training_status}' but load focus '{load_focus}' — "
+                              "excess anaerobic load, cut the hard sessions."}
+        return {"tier": "hold", "severity": None,
+                "reason": f"Training status '{training_status}' — productive, absorbing load well."}
+
+    # No usable status phrase (e.g. NO_STATUS, or only load focus present) —
+    # lean on load focus alone.
+    if anaerobic_excess:
+        return {"tier": "cutback", "severity": "moderate",
+                "reason": f"Load focus '{load_focus}' — excess anaerobic load, back off hard sessions."}
+    if aerobic_shortage:
+        return {"tier": "add", "severity": "moderate",
+                "reason": f"Load focus '{load_focus}' — aerobic base is short, room to add easy volume."}
+
+    return {"tier": "unknown", "severity": None,
+            "reason": f"Training status '{training_status or 'N/A'}' / load focus "
+                      f"'{load_focus or 'N/A'}' — no clear load signal."}
+
+
 def format_weekly_review(this_week: dict, last_week: dict, load_data: dict, plan_context: str = "") -> str:
     vol_delta_pct = None
     if last_week["total_distance_km"] > 0:
@@ -598,7 +681,7 @@ def format_weekly_review(this_week: dict, last_week: dict, load_data: dict, plan
             / last_week["total_distance_km"] * 100, 1
         )
 
-    recommendation = _week_recommendation(load_data["acwr"], vol_delta_pct)
+    recommendation = _week_recommendation(load_data, vol_delta_pct)
 
     def fmt_types(tc: dict) -> str:
         return ", ".join(f"{k} x{v}" for k, v in sorted(tc.items())) or "none"
@@ -634,7 +717,8 @@ def format_weekly_review(this_week: dict, last_week: dict, load_data: dict, plan
             f"(aerobic TE: {bs['aerobic_te']})"
         )
 
-    lines.append(f"\nACWR: {load_data['acwr'] or 'N/A'}  |  "
+    lines.append(f"\nACWR (reference only — training status governs, not a 0.8–1.3 gate): "
+                 f"{load_data['acwr'] or 'N/A'}  |  "
                  f"Acute load: {load_data['acute_load']}  |  "
                  f"Chronic load: {load_data['chronic_load']}")
 
@@ -692,10 +776,12 @@ def format_weekly_review(this_week: dict, last_week: dict, load_data: dict, plan
         except Exception:
             pass
 
-    # ── Recurring niggle scan ─────────────────────────────────────────────
-    niggle_warnings = _scan_niggle_patterns()
-    for w in niggle_warnings:
-        lines.append(f"\n{w}")
+    # ── Logged feedback scan (niggles + RPE/feel) ─────────────────────────
+    fb_lines = _feedback_review_lines()
+    if fb_lines:
+        lines.append("\nLOGGED FEEDBACK (last 14d):")
+        for w in fb_lines:
+            lines.append(f"  {w}")
 
     lines.append(f"\nNEXT WEEK: {recommendation}")
 
@@ -763,6 +849,13 @@ def format_monthly_review(this_month: dict, last_month: dict, trend: list, plan_
         focus = "Big volume jump this month. Consolidate — maintain distance, add one quality day."
     else:
         focus = "Solid month. Stay consistent and progress the long run by ~1km per week."
+
+    # ── Logged feedback scan (niggles + RPE/feel) ─────────────────────────
+    fb_lines = _feedback_review_lines()
+    if fb_lines:
+        lines.append("\nLOGGED FEEDBACK (last 14d):")
+        for w in fb_lines:
+            lines.append(f"  {w}")
 
     lines.append(f"\nNEXT MONTH FOCUS: {focus}")
 
@@ -893,16 +986,18 @@ def fetch_strength_exercise_sets(activity_id: int | None = None) -> dict:
         reps   = int(s.get("repetitionCount") or s.get("reps") or 0)
         weight = s.get("weight") or s.get("weightValue")
 
-        # Normalise weight to kg
-        wu = s.get("weightUnit") or {}
-        if isinstance(wu, dict):
-            unit_key = (wu.get("key") or wu.get("unitKey") or "kilogram").lower()
-        else:
-            unit_key = str(wu).lower()
-        if weight and "pound" in unit_key:
-            weight = round(float(weight) * 0.453592, 2)
-        elif weight:
-            weight = round(float(weight), 2)
+        # Normalise weight to kg.
+        # Garmin's exercise-set API returns weightValue in grams regardless
+        # of the unitKey display preference (unitKey only affects how the
+        # Connect app *displays* the number, not the raw stored value).
+        # Confirmed empirically against 2026-06-28 data: raw 70000 / 65000 /
+        # 80000 match the 70kg/65kg/70-80kg loads actually programmed and
+        # logged for that session. Previously this code left kilogram-unit
+        # entries un-divided (saving e.g. 70000kg as a bench default) and
+        # additionally mis-treated pound-unit entries as if the raw value
+        # were already in pounds rather than grams.
+        if weight:
+            weight = round(float(weight) / 1000, 2)
 
         if key not in exercises:
             exercises[key] = {

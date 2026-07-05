@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "garmin-coach",
   "display_name": "Garmin Morning Coach",
-  "version": "1.18.2",
+  "version": "1.23.2",
   "description": "Pulls Garmin data and provides daily readiness, training load, fitness trend, and recent activity coaching",
   "author": {
     "name": "You"
@@ -125,7 +125,15 @@
     },
     {
       "name": "generate_week",
-      "description": "Generate and schedule a full week of training sessions on Garmin Connect based on plan phase, ACWR, blocked days, and personalized pace/HR targets from your lactate threshold. Requires an active training plan."
+      "description": "Generate and schedule a full week of training sessions on Garmin Connect based on plan phase, ACWR, blocked days, and personalized pace/HR targets from your lactate threshold. Automatically marks the week as planned so the morning coach skips creation. Requires an active training plan."
+    },
+    {
+      "name": "mark_week_planned",
+      "description": "Mark a week as fully planned in the DB so the Monday morning coach skips workout creation. Called automatically by generate_week. Also call manually after setting up a custom or deload week."
+    },
+    {
+      "name": "get_week_planned",
+      "description": "Check whether a week has been marked as planned. Returns planned (bool), week_start, planned_at, and planned_by. Defaults to this week if no date given."
     },
     {
       "name": "get_race_strategy",
@@ -144,6 +152,14 @@
       "description": "View current default weights, sets, and reps for all tracked strength exercises, or filter to a specific exercise name."
     },
     {
+      "name": "set_exercise_override",
+      "description": "Temporarily adjust an exercise's programmed weight (percentage or kg, signed) without changing its stored base default \u2014 for a sick/deload/travel week. Optional start_date/end_date window auto-reverts to base afterwards. Newest active override wins; tag with a label to clear a batch."
+    },
+    {
+      "name": "clear_exercise_override",
+      "description": "Remove active exercise weight overrides, reverting to base defaults. Specify one of: name (one exercise), label (a tagged batch), or all=true. Overrides are deactivated, not deleted, so history is preserved."
+    },
+    {
       "name": "log_strength_progress",
       "description": "Log per-exercise session outcomes. Completed exercises (all reps hit) get +10% weight suggestion; failed exercises get -10%. Set apply_changes=true to immediately update defaults for the next session."
     },
@@ -152,12 +168,8 @@
       "description": "Pull a completed strength activity from Garmin Connect and compare each exercise against stored defaults. Shows logged weight vs default, sets completed vs planned, and flags new exercises. Set apply_defaults=true to save logged weights as new defaults for all fully-completed exercises."
     },
     {
-      "name": "dump_morning_raw",
-      "description": "Diagnostic tool. Dumps the raw API responses for HRV, heart rate, sleep, body battery, stress, and training readiness. Use when morning metrics show unexpected nulls to see exactly what Garmin is returning."
-    },
-    {
-      "name": "dump_strength_activity",
-      "description": "Diagnostic tool. Dumps the raw exerciseSets payload from Garmin Connect for a completed strength activity. If no activity_id is given, uses the most recent fitness_equipment activity in the last 30 days."
+      "name": "get_zones",
+      "description": "Fetch lactate threshold data from Garmin and derive personalised HR and pace zones (easy, aerobic, threshold, interval) using Friel running coefficients. Returns bpm ranges and pace ranges for each zone."
     }
   ],
   "user_config": {

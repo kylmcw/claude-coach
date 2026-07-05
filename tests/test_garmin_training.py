@@ -342,40 +342,51 @@ def test_zone_distribution_hrTimeInZones_key(monkeypatch):
     assert out["easy_pct"] == 100.0
 
 
-# ─── _week_recommendation ─────────────────────────────────────────────────────
+# ─── _week_recommendation (now driven by training_status / load_focus) ────────
 
-def test_week_rec_none_acwr():
-    assert "Not enough" in training._week_recommendation(None, None)
-
-
-def test_week_rec_danger_zone():
-    rec = training._week_recommendation(1.6, None)
-    assert "MANDATORY EASY" in rec or "danger zone" in rec.upper() or "ACWR" in rec
+def _load(status=None, focus=None, acwr=None):
+    return {"training_status": status, "load_focus": focus, "acwr": acwr}
 
 
-def test_week_rec_elevated():
-    rec = training._week_recommendation(1.4, None)
+def test_week_rec_no_status_data():
+    assert "Not enough" in training._week_recommendation(_load(), None)
+
+
+def test_week_rec_danger_zone_strained():
+    rec = training._week_recommendation(_load(status="STRAINED"), None)
+    assert "MANDATORY EASY" in rec
+
+
+def test_week_rec_elevated_overreaching():
+    rec = training._week_recommendation(_load(status="OVERREACHING_2"), None)
     assert "Back off" in rec
 
 
-def test_week_rec_underloading():
-    rec = training._week_recommendation(0.7, None)
-    assert "Underloading" in rec or "add" in rec.lower()
+def test_week_rec_underloading_detraining():
+    rec = training._week_recommendation(_load(status="DETRAINING"), None)
+    assert "build" in rec.lower() or "add" in rec.lower()
 
 
 def test_week_rec_volume_drop_rebuild():
-    rec = training._week_recommendation(0.7, -25.0)
+    rec = training._week_recommendation(_load(status="DETRAINING"), -25.0)
     assert "rebuild" in rec.lower() or "dropped" in rec.lower()
 
 
-def test_week_rec_big_volume_jump():
-    rec = training._week_recommendation(1.0, 20.0)
+def test_week_rec_big_volume_jump_while_productive():
+    rec = training._week_recommendation(_load(status="PRODUCTIVE_6"), 20.0)
     assert "Hold" in rec or "steady" in rec.lower() or "jump" in rec.lower()
 
 
-def test_week_rec_optimal():
-    rec = training._week_recommendation(1.1, 5.0)
-    assert "optimal" in rec.lower() or "course" in rec.lower()
+def test_week_rec_productive_hold():
+    rec = training._week_recommendation(_load(status="PRODUCTIVE_6"), 5.0)
+    assert "course" in rec.lower()
+
+
+def test_week_rec_ignores_acwr_ratio():
+    # ACWR 1.6 would be "danger" under the old logic; PRODUCTIVE status must win.
+    rec = training._week_recommendation(_load(status="PRODUCTIVE_6", acwr=1.6), None)
+    assert "MANDATORY" not in rec
+    assert "course" in rec.lower()
 
 
 # ─── _delta_str ───────────────────────────────────────────────────────────────
@@ -444,43 +455,60 @@ def _make_week(sessions=4, distance=40.0):
     return {"session_count": sessions, "total_distance_km": distance}
 
 
+_PRODUCTIVE = {"training_status": "PRODUCTIVE_6", "load_focus": "AEROBIC_LOW_FOCUS", "acwr": 1.1}
+
+
 def test_suggestions_returns_list():
-    out = training.generate_week_suggestions(_make_week(), _make_week(), {"acwr": 1.0})
+    out = training.generate_week_suggestions(_make_week(), _make_week(), _PRODUCTIVE)
     assert isinstance(out, list)
 
 
 def test_suggestions_max_three():
-    out = training.generate_week_suggestions(_make_week(), _make_week(), {"acwr": 1.0})
+    out = training.generate_week_suggestions(_make_week(), _make_week(), _PRODUCTIVE)
     assert len(out) <= 3
 
 
-def test_suggestions_mandatory_easy_week_when_acwr_over_15():
+def test_suggestions_mandatory_easy_week_when_strained():
     this_week = _make_week(sessions=5, distance=60.0)
     last_week = _make_week(sessions=4, distance=40.0)
-    out = training.generate_week_suggestions(this_week, last_week, {"acwr": 1.6})
-    assert any("Mandatory easy week" in s["recommendation"] or "mandatory" in s["recommendation"].lower()
-               for s in out)
+    load = {"training_status": "STRAINED", "load_focus": None, "acwr": 1.6}
+    out = training.generate_week_suggestions(this_week, last_week, load)
+    assert any("mandatory" in s["recommendation"].lower() for s in out)
 
 
-def test_suggestions_back_off_when_acwr_between_13_and_15():
-    out = training.generate_week_suggestions(_make_week(distance=50.0), _make_week(distance=40.0), {"acwr": 1.4})
-    assert any("Back off" in s["recommendation"] or "back off" in s["recommendation"].lower()
-               for s in out)
+def test_suggestions_back_off_when_overreaching():
+    load = {"training_status": "OVERREACHING_2", "load_focus": None, "acwr": 1.4}
+    out = training.generate_week_suggestions(_make_week(distance=50.0), _make_week(distance=40.0), load)
+    assert any("back off" in s["recommendation"].lower() for s in out)
+
+
+def test_suggestions_ignore_high_acwr_when_productive():
+    # ACWR 1.6 alone would trigger a cutback; PRODUCTIVE status must override.
+    load = {"training_status": "PRODUCTIVE_6", "load_focus": "AEROBIC_LOW_FOCUS", "acwr": 1.6}
+    out = training.generate_week_suggestions(_make_week(), _make_week(), load)
+    assert not any("mandatory" in s["recommendation"].lower() for s in out)
+    assert any(s["action_type"] == "note_only" for s in out)
 
 
 def test_suggestions_low_sessions_triggers_consistency():
-    out = training.generate_week_suggestions(_make_week(sessions=2), _make_week(), {"acwr": 1.0})
+    out = training.generate_week_suggestions(_make_week(sessions=2), _make_week(), _PRODUCTIVE)
     assert any(s["action_type"] == "add_session" for s in out)
 
 
-def test_suggestions_no_acwr_data():
-    out = training.generate_week_suggestions(_make_week(), _make_week(), {"acwr": None})
+def test_suggestions_no_status_data():
+    out = training.generate_week_suggestions(_make_week(), _make_week(),
+                                             {"training_status": None, "load_focus": None, "acwr": None})
     assert len(out) >= 1
-    assert any("gradually" in s["recommendation"].lower() or "ACWR" in s["recommendation"] for s in out)
+    assert any("gradually" in s["recommendation"].lower() for s in out)
+
+
+def test_suggestions_acwr_shown_as_reference_only():
+    out = training.generate_week_suggestions(_make_week(), _make_week(), _PRODUCTIVE)
+    assert any("reference" in s["rationale"].lower() for s in out)
 
 
 def test_suggestions_each_has_required_keys():
-    out = training.generate_week_suggestions(_make_week(), _make_week(), {"acwr": 1.1})
+    out = training.generate_week_suggestions(_make_week(), _make_week(), _PRODUCTIVE)
     for s in out:
         assert "recommendation" in s
         assert "rationale" in s
@@ -489,9 +517,55 @@ def test_suggestions_each_has_required_keys():
 
 def test_suggestions_action_types_are_valid():
     valid_types = {"adjust_volume", "add_session", "add_quality", "note_only"}
-    out = training.generate_week_suggestions(_make_week(), _make_week(), {"acwr": 1.1})
+    out = training.generate_week_suggestions(_make_week(), _make_week(), _PRODUCTIVE)
     for s in out:
         assert s["action_type"] in valid_types
+
+
+# ─── classify_load_state ──────────────────────────────────────────────────────
+
+def test_classify_none_both_is_unknown():
+    st = training.classify_load_state(None, None)
+    assert st["tier"] == "unknown"
+    assert "insufficient" in st["reason"].lower() or "no training status" in st["reason"].lower()
+
+
+def test_classify_strained_is_high_cutback():
+    st = training.classify_load_state("STRAINED", None)
+    assert st["tier"] == "cutback" and st["severity"] == "high"
+
+
+def test_classify_overreaching_is_cutback():
+    assert training.classify_load_state("OVERREACHING_1", None)["tier"] == "cutback"
+
+
+def test_classify_unproductive_is_cutback_not_productive():
+    # "UNPRODUCTIVE" contains "PRODUCTIVE" — must not be misread as hold.
+    assert training.classify_load_state("UNPRODUCTIVE_3", None)["tier"] == "cutback"
+
+
+def test_classify_detraining_is_add():
+    assert training.classify_load_state("DETRAINING", None)["tier"] == "add"
+
+
+def test_classify_productive_is_hold():
+    assert training.classify_load_state("PRODUCTIVE_6", "AEROBIC_LOW_FOCUS")["tier"] == "hold"
+
+
+def test_classify_productive_but_anaerobic_excess_cuts_back():
+    st = training.classify_load_state("PRODUCTIVE_1", "ANAEROBIC_SURPLUS")
+    assert st["tier"] == "cutback"
+
+
+def test_classify_aerobic_shortage_without_status_adds():
+    st = training.classify_load_state(None, "AEROBIC_LOW_SHORTAGE")
+    assert st["tier"] == "add"
+
+
+def test_classify_anaerobic_not_matched_as_aerobic():
+    # "ANAEROBIC" contains "AEROBIC"; anaerobic shortage must not read as aerobic add.
+    st = training.classify_load_state(None, "ANAEROBIC_SHORTAGE")
+    assert st["tier"] != "add"
 
 
 # ─── Pace formatting (via fetch_recent_activities processing logic) ───────────

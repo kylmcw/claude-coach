@@ -302,42 +302,38 @@ def test_red_decision_says_rest():
     assert "REST DAY" in decision
 
 
-# ─── assess_acwr ─────────────────────────────────────────────────────────────
+# ─── assess_training_state (driven by training status + load focus) ──────────
 
-def test_acwr_none():
-    assert "Cannot compute" in readiness.assess_acwr(None)
-
-
-def test_acwr_under_08():
-    result = readiness.assess_acwr(0.7)
-    assert "underloading" in result.lower() or "Underloading" in result
+def _load(status=None, focus=None, acwr=None):
+    return {"training_status": status, "load_focus": focus, "acwr": acwr}
 
 
-def test_acwr_optimal_range():
-    result = readiness.assess_acwr(1.1)
-    assert "optimal" in result.lower()
+def test_state_no_status_data():
+    assert "unavailable" in readiness.assess_training_state(_load()).lower()
 
 
-def test_acwr_elevated():
-    result = readiness.assess_acwr(1.4)
-    assert "elevated" in result.lower() or "Back off" in result
+def test_state_detraining_add_volume():
+    result = readiness.assess_training_state(_load(status="DETRAINING"))
+    assert "add volume" in result.lower()
 
 
-def test_acwr_danger_zone():
-    result = readiness.assess_acwr(1.6)
-    assert "danger" in result.lower() or "Mandatory" in result
+def test_state_productive_stay_course():
+    result = readiness.assess_training_state(_load(status="PRODUCTIVE_6"))
+    assert "stay the course" in result.lower()
 
 
-def test_acwr_exact_08_is_optimal():
-    result = readiness.assess_acwr(0.8)
-    assert "optimal" in result.lower()
+def test_state_overreaching_back_off():
+    result = readiness.assess_training_state(_load(status="OVERREACHING_1"))
+    assert "back off" in result.lower()
 
 
-def test_acwr_exact_13_is_optimal():
-    result = readiness.assess_acwr(1.3)
-    assert "optimal" in result.lower()
+def test_state_strained_mandatory_easy():
+    result = readiness.assess_training_state(_load(status="STRAINED"))
+    assert "mandatory easy" in result.lower()
 
 
-def test_acwr_exact_15_is_elevated():
-    result = readiness.assess_acwr(1.5)
-    assert "elevated" in result.lower() or "Back off" in result
+def test_state_shows_acwr_as_reference():
+    # ACWR is displayed but does not drive the call: 1.6 + PRODUCTIVE = stay course.
+    result = readiness.assess_training_state(_load(status="PRODUCTIVE_6", acwr=1.6))
+    assert "1.6" in result and "reference" in result.lower()
+    assert "mandatory" not in result.lower()

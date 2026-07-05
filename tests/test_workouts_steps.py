@@ -51,6 +51,16 @@ def test_build_running_steps_repeat_is_single_group():
     assert len(out) == 3  # warmup, one repeat group, cooldown
 
 
+def test_interval_distance_uses_distance_not_lap_button():
+    # Garmin's conditionTypeId 1 == lap.button; distance must be 3, else the
+    # step renders "until lap button" on the watch.
+    out = steps.build_running_steps([{"type": "interval", "distance_meters": 800}])
+    ec = out[0].endCondition
+    assert ec["conditionTypeId"] == 3
+    assert ec["conditionTypeKey"] == "distance"
+    assert out[0].endConditionValue == 800.0
+
+
 def test_build_running_steps_unknown_type_raises():
     with pytest.raises(ValueError):
         steps.build_running_steps([{"type": "sprintz", "duration_minutes": 1}])
