@@ -52,7 +52,7 @@ After ANY code change, before marking done:
 ./run-test.sh
 
 # Import check only (no credentials needed)
-./diagnose.sh
+.venv/bin/python3 -c "import sys; sys.path.insert(0, 'server'); import main; print('OK')"
 ```
 
 ## Architecture

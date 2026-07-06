@@ -44,7 +44,7 @@ Each morning, `get_daily_briefing` gives you everything in one call: readiness (
 
 ## Features
 
-Twenty-eight tools are available to Claude, organized by category.
+Thirty-eight tools are available to Claude, organized by category.
 
 **Morning & readiness**
 - **get_daily_briefing** — Single-call morning briefing: readiness score, today's scheduled session, best weather window, and a go/modify/rest verdict. When AMBER or RED meets a quality session, proposes a swap automatically.
@@ -58,6 +58,7 @@ Twenty-eight tools are available to Claude, organized by category.
 - **get_fitness_scores** — Garmin's Endurance Score and Hill Score for today, with descriptive level labels.
 - **get_recent_activities** — Your last 7 days of activities with distance, pace, duration, heart rate, and aerobic/anaerobic training effect scores.
 - **analyze_run** — Deep analysis of a specific run (or your most recent if no ID given): cadence, stride length, ground contact time and balance, vertical oscillation, vertical ratio, running power, per-km splits, HR zone breakdown, and actionable form recommendations.
+- **get_zones** — Personalised HR and pace zones (easy, aerobic, threshold, interval) derived from your lactate threshold using Friel running coefficients.
 
 **Weekly & monthly reviews**
 - **get_weekly_review** — This week vs last week: distance, time, sessions, ACWR, intensity distribution (methodology-aware: polarized 80/20 or pyramidal 70/20/10), recurring niggle warnings, and a specific coming-week recommendation.
@@ -67,6 +68,8 @@ Twenty-eight tools are available to Claude, organized by category.
 - **setup_training_plan** — Set up or update your race training plan. Call with no arguments to get a questionnaire driven by your Garmin race predictions. Call with `race_date` and `training_days_per_week` to create the plan.
 - **get_plan_status** — Full plan breakdown: race details, countdown, current week and phase, predicted vs target time, weekly structure, and a phase-by-phase table with your current position marked.
 - **generate_week** — Generate and schedule a full week of training sessions on Garmin Connect based on your current phase, ACWR, blocked days, and personalized pace/HR targets from your lactate threshold. Requires an active training plan.
+- **mark_week_planned** — Mark a week as fully planned so the Monday morning coach skips workout generation for it. Called automatically by `generate_week`; call manually after setting up a custom or deload week.
+- **get_week_planned** — Check whether a given week has already been marked as planned.
 - **get_race_strategy** — Race-day pacing strategy: gap analysis between your goal and Garmin's prediction, per-km pace bands, half-split targets, taper checklist, and race-day cues. Accepts an optional target time override.
 - **clear_training_plan** — Deletes the current plan. Requires `confirmation=true`. Use when starting a new training cycle.
 
@@ -79,9 +82,18 @@ Twenty-eight tools are available to Claude, organized by category.
 - **delete_workout** — Permanently delete a workout template from your Garmin Connect library.
 - **unschedule_workout** — Remove a workout from your calendar without deleting the template.
 
+**Strength exercises**
+- **set_exercise_defaults** — Set or update default weight/sets/reps for one or more strength exercises, auto-applied when creating strength workouts.
+- **get_exercise_defaults** — View current default weights, sets, and reps for all tracked strength exercises (or a single named one).
+- **log_strength_progress** — Log the outcome of a strength session per exercise and get progressive-overload suggestions (+10% on success, -10% on failure), optionally applied immediately.
+- **review_strength_workout** — Pull a completed strength activity from Garmin Connect and compare each exercise against stored defaults; optionally save logged weights as new defaults.
+- **set_exercise_override** — Temporarily adjust the programmed weight for an exercise (percentage or kg delta) for a deload, travel, or sick week, with an optional date window that auto-reverts.
+- **clear_exercise_override** — Remove active weight overrides by exercise name, label, or all at once.
+
 **Coaching history**
 - **log_workout_feedback** — Log a completed session with RPE, feel, niggles, and notes. Links to the current training cycle and builds longitudinal coaching context.
 - **get_workout_history** — Retrieve logged session history with feedback, ordered by date. Used by the coach to identify fatigue patterns, load trends, and recurring niggles.
+- **backfill_runs** — Scan the last N days of Garmin activities and log anything missing from history — recovers runs from days you didn't open the coach. Idempotent.
 - **get_pending_suggestions** — Return all pending coaching suggestions not yet approved or denied. Suggestions are generated automatically during weekly review based on ACWR, volume trends, and session consistency.
 - **approve_suggestion** — Approve or deny a pending coaching suggestion by ID. Both outcomes are recorded.
 
@@ -247,30 +259,39 @@ Both methodologies are supported in `generate_week`, weekly review intensity dis
 
 ```
 garmin-coach/
-├── manifest.json              — Plugin manifest (version, 28 tool declarations, user config)
+├── manifest.json              — Plugin manifest (version, 38 tool declarations, user config)
 ├── server/
-│   ├── main.py                — MCP server entry point and tool dispatcher
-│   ├── tools.py               — 28 Tool schema definitions
-│   ├── analysis.py            — Run dynamics analysis and form coaching
-│   ├── briefing.py            — Daily briefing (readiness + schedule + weather + verdict)
-│   ├── calibration.py         — HRV/RHR baseline calibration and storage
-│   ├── client.py              — Lazy-init Garmin client singleton
-│   ├── history.py             — Workout history SQLite database
-│   ├── plan.py                — Training plan CRUD, phase logic, session planning
-│   ├── race_strategy.py       — Race-day pacing strategy and taper checklist
-│   ├── readiness.py           — Morning metrics fetch and GREEN/AMBER/RED assessment
-│   ├── recovery_trend.py      — 14-day recovery trend with overreaching detection
-│   ├── schedule.py            — Garmin Connect calendar fetch and formatting
-│   ├── thresholds.py          — Lactate threshold zones from Garmin data
-│   ├── training.py            — Training load, activities, weekly/monthly reviews
-│   ├── utils.py               — Shared helpers
-│   ├── weather.py             — Weather windows, location resolution, scoring
-│   └── workouts.py            — Running and strength workout creation
+│   ├── main.py                — MCP server entry point and if/elif tool dispatcher
+│   ├── tools.py               — 38 Tool schema definitions
+│   ├── utils.py                — Shared helpers
+│   ├── garmin/                 — Garmin API layer
+│   │   ├── client.py           — Lazy-init Garmin client singleton
+│   │   ├── calibration.py      — HRV/RHR baseline calibration and storage
+│   │   ├── readiness.py        — Morning metrics fetch and GREEN/AMBER/RED assessment
+│   │   ├── analysis.py         — Run dynamics analysis and form coaching
+│   │   ├── training.py         — Training load, activities, weekly/monthly reviews
+│   │   └── schedule.py         — Garmin Connect calendar fetch and formatting
+│   ├── coaching/                — Coaching logic
+│   │   ├── plan.py             — Training plan CRUD, phase logic, session planning
+│   │   ├── thresholds.py        — Lactate threshold zones from Garmin data
+│   │   ├── briefing.py          — Daily briefing (readiness + schedule + weather + verdict)
+│   │   ├── race_strategy.py    — Race-day pacing strategy and taper checklist
+│   │   ├── recovery_trend.py   — 14-day recovery trend with overreaching detection
+│   │   └── weather.py          — Weather windows, location resolution, scoring
+│   ├── db/                     — SQLite persistence
+│   │   ├── history.py          — Workouts/feedback/coach_log + backfill/auto-log
+│   │   └── exercises.py        — Exercise registry, aliases, defaults, progression
+│   └── workouts/                — Workout creation
+│       ├── steps.py            — Running/strength step builders
+│       ├── workouts.py         — Uploaders to Garmin Connect
+│       └── validate.py         — PreToolUse guard against the training plan
 ├── start.sh                   — Self-healing startup script (rebuilds broken venvs)
-├── diagnose.sh                — Import checker for debugging startup issues
 ├── run-test.sh                — Smoke test: prompts for credentials and runs a quick data pull
+├── deploy.sh                  — Rsyncs the project into Kyle's and Kayleigh's local Claude extensions and restarts the app
 ├── garmin-coach.mcpb          — Distributable plugin bundle
+├── garmin-coach-kayleigh.mcpb — Same code, patched manifest name/display_name
 ├── backups/                   — Pre-change mcpb snapshots (2 kept at all times)
+├── tests/                     — Pytest unit-test suite (no network/creds required)
 └── CLAUDE.md                  — Developer build/release instructions and API conventions
 
 ~/.garmin-coach.json           — Personal HRV/RHR baselines (auto-created, refreshed every 7 days)
@@ -294,7 +315,7 @@ Weather and location use free public APIs with no key required (Open-Meteo for f
 ## Troubleshooting
 
 **Plugin won't start / import errors**
-Run `./diagnose.sh` from the project directory. It checks the Python environment and imports and prints the exact error.
+Run `.venv/bin/python3 -c "import sys; sys.path.insert(0, 'server'); import main; print('OK')"` from the project directory. It checks the Python environment and imports and prints the exact error.
 
 **Calibration takes a long time on first run**
 Normal — it's making ~60 API calls to Garmin (30 days × HRV + RHR). Subsequent calls are instant since results are cached.

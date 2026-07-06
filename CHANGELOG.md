@@ -1,5 +1,37 @@
 # Garmin Morning Coach — Changelog
 
+## 1.23.3 (2026-07-06) — Docs audit + missing manifest tool
+
+### Fixed
+- `manifest.json` was missing the `backfill_runs` tool declaration even though it's fully implemented (`db/history.py`, dispatched in `main.py`, schema in `tools.py`) — the built `.mcpb` never exposed it to Claude. Added.
+
+### Docs
+- README's Project Structure section still showed the pre-1.18.0 flat `server/*.py` layout; updated to the current `server/{garmin,coaching,db,workouts}/` subpackage layout.
+- README's tool count and Features list were stuck at 28; updated to the current 38 (added `get_zones`, `mark_week_planned`, `get_week_planned`, `set_exercise_defaults`, `get_exercise_defaults`, `set_exercise_override`, `clear_exercise_override`, `log_strength_progress`, `review_strength_workout`, `backfill_runs`).
+- Removed dead `./diagnose.sh` references from README and root `CLAUDE.md` — the script was deleted in 1.23.2; both now point at the inline import smoke-test.
+- `.claude/skills/release.md` only described the old single-bundle release flow; updated to match `CLAUDE.md`'s dual-bundle (Kyle + Kayleigh) build and `deploy.sh` step.
+
+## 1.23.2 (2026-07-05) — Native training-status load engine + weekly-context awareness
+
+Drive load/volume decisions off Garmin's native training status + load focus instead of the ACWR ratio, give single-run analysis whole-week context, and factor logged RPE/feel/niggles into reviews and week planning.
+
+### Load engine
+- `classify_load_state()` maps `trainingStatusFeedbackPhrase` + `trainingBalanceFeedbackPhrase` onto cutback/hold/add/unknown tiers (keyword-matched, robust to firmware phrase variants). Drives `generate_week_suggestions`, `_week_recommendation`, `assess_training_state` (renamed from `assess_acwr`), and `plan_week_sessions` volume scaling.
+- `fetch_training_load()` now digs the real nested metrics-service shape; uses `dailyAcuteChronicWorkloadRatio` (not `acwrPercent`) for the displayed ACWR.
+
+### Weekly context + feedback
+- `analyze_run` pulls last-7-day activities + load; `build_week_context` surfaces "this week so far" including quality already done, so it stops prescribing intensity that's already been run.
+- `assess_recent_feedback()` (`db/history`) scans logged RPE/feel/niggles; weekly and monthly reviews now print a feedback block; `plan_week_sessions` backs off volume on recurring niggle / high-RPE trend even when Garmin load looks fine. Replaces `_scan_niggle_patterns` with the unified scanner.
+
+### ACWR reference-only guardrails
+- Every ACWR surface now annotated "reference only — training status governs" so the coaching model stops re-deriving the old 0.8–1.3 danger-band rubric. `running-coach` agent persona updated to match.
+
+### Fixed
+- **Distance laps were being created as "lap press" steps.** `build_running_steps()` set the distance end condition's `conditionTypeId` from `ConditionType.DISTANCE`, but the `garminconnect` library defines that as `1` — Garmin's id for lap.button. Every distance-based lap was silently stored as a "press lap button" step instead of a distance lap. Added explicit `COND_TIME`/`COND_DISTANCE` constants with Garmin's real values (2 and 3) and use those instead of the library enum. Time laps were already correct and unaffected.
+- Removed dead `diagnose.sh` (superseded by the inline import smoke-test — see 1.23.3 docs fix above for catching up the references to it).
+
+Tests: +30 (`classify_load_state`, `assess_recent_feedback`, `build_week_context`, `plan_week_sessions` feedback back-off). Full suite 257 passing.
+
 ## 1.18.2 (2026-06-11) — Bugs caught by the new unit-test suite
 
 Added an isolated unit-test suite (`tests/`, pytest, 228 tests, no network/creds) across all domain folders. Writing it surfaced three production bugs, now fixed:

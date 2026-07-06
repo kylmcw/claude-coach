@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "garmin-coach",
   "display_name": "Garmin Morning Coach",
-  "version": "1.23.2",
+  "version": "1.23.3",
   "description": "Pulls Garmin data and provides daily readiness, training load, fitness trend, and recent activity coaching",
   "author": {
     "name": "You"
@@ -170,6 +170,10 @@
     {
       "name": "get_zones",
       "description": "Fetch lactate threshold data from Garmin and derive personalised HR and pace zones (easy, aerobic, threshold, interval) using Friel running coefficients. Returns bpm ranges and pace ranges for each zone."
+    },
+    {
+      "name": "backfill_runs",
+      "description": "Backfill recently completed Garmin activities into the local history DB. Unlike the morning auto-log (which only reconciles yesterday), this scans the last N days and logs any activity not already recorded. Idempotent: already-logged activities are skipped."
     }
   ],
   "user_config": {
