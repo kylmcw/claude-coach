@@ -642,7 +642,7 @@ def generate_week_plan(
     Returns a list of summary dicts for created sessions.
     """
     from coaching.plan import plan_week_sessions
-    from workouts.workouts import create_and_upload_running_workout
+    from workouts.workouts import create_and_upload_running_workout, create_and_upload_strength_workout
     from garmin.client import get_client
 
     sessions  = plan_week_sessions(plan, week_start_date, target_km, load_data)
@@ -663,17 +663,24 @@ def generate_week_plan(
                 continue
 
             try:
-                upload = create_and_upload_running_workout(
-                    sess["workout_name"],
-                    sess["description"],
-                    sess["steps"],
-                )
+                if wtype == "strength":
+                    upload = create_and_upload_strength_workout(
+                        sess["workout_name"],
+                        sess["description"],
+                        sess["exercises"],
+                    )
+                else:
+                    upload = create_and_upload_running_workout(
+                        sess["workout_name"],
+                        sess["description"],
+                        sess["steps"],
+                    )
                 garmin_workout_id = upload["workout_id"]
             except Exception as exc:
                 created.append({
                     "date": date_str, "type": wtype,
                     "workout_name": sess["workout_name"],
-                    "planned_distance_km": sess["planned_distance_km"],
+                    "planned_distance_km": sess.get("planned_distance_km"),
                     "error": f"upload failed: {exc}",
                 })
                 continue
@@ -694,7 +701,7 @@ def generate_week_plan(
                 date_str=date_str,
                 workout_type=wtype,
                 workout_name=sess["workout_name"],
-                planned_distance_km=sess["planned_distance_km"],
+                planned_distance_km=sess.get("planned_distance_km"),
                 garmin_workout_id=garmin_workout_id,
                 garmin_scheduled_id=garmin_scheduled_id,
             )
@@ -703,7 +710,7 @@ def generate_week_plan(
                 "date":                 date_str,
                 "type":                 wtype,
                 "workout_name":         sess["workout_name"],
-                "planned_distance_km":  sess["planned_distance_km"],
+                "planned_distance_km":  sess.get("planned_distance_km"),
                 "garmin_workout_id":    garmin_workout_id,
                 "garmin_scheduled_id":  garmin_scheduled_id,
             })

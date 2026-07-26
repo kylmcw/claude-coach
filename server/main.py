@@ -758,9 +758,11 @@ async def call_tool(name: str, arguments: dict):
             if s.get("error"):
                 lines.append(f"  {s['date']}  {s['workout_name']} — ERROR: {s['error']}")
             else:
+                km = s.get("planned_distance_km")
+                km_label = f"({km} km)" if km is not None else "(strength)"
                 lines.append(
                     f"  {s['date']}  {s['workout_name']}  "
-                    f"({s['planned_distance_km']} km)  ID: {s.get('garmin_workout_id')}"
+                    f"{km_label}  ID: {s.get('garmin_workout_id')}"
                 )
         lines.append("\nAll sessions have been scheduled on your Garmin Connect calendar.")
 
