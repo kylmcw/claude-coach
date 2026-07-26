@@ -80,8 +80,29 @@ def calibrate_baselines() -> tuple[int, int, int]:
         "rhr_samples":    len(rhr_values),
         "lookback_days":  CALIBRATION_LOOKBACK,
     }
-    CALIBRATION_FILE.write_text(json.dumps(state, indent=2))
+    update_state(**state)
     return hrv_low, hrv_high, rhr_norm
+
+
+def read_state() -> dict:
+    """Return the persisted calibration state, or {} if absent/unreadable."""
+    try:
+        return json.loads(CALIBRATION_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def update_state(**values) -> None:
+    """
+    Merge values into the calibration file.
+
+    Must merge, not overwrite: the file also holds keys this module doesn't own
+    (lt_pace_sec override, cached lap-derived LT pace), and a 7-day recalibration
+    would otherwise silently wipe them.
+    """
+    state = read_state()
+    state.update(values)
+    CALIBRATION_FILE.write_text(json.dumps(state, indent=2))
 
 
 def load_baselines() -> tuple[int, int, int]:
