@@ -508,6 +508,42 @@ def plan_week_sessions(
                     "steps":               _easy_steps(km),
                 })
 
+    # ── Strength sessions ────────────────────────────────────────────────────
+    # generate_week previously only ever built running sessions — strength_days_per_week
+    # was stored on the plan but never consumed. Fill it in: pick slots from the days
+    # not already used for running, and program each from the exercises Kyle already
+    # has defaults for (set_exercise_defaults), round-robin split across the sessions
+    # so the full rotation gets covered over the week.
+    strength_days = plan.get("strength_days_per_week", 0) if plan.get("include_strength") else 0
+    if strength_days > 0:
+        run_dates = {s.isoformat() for s in run_slots}
+        strength_slots = [d for d in available if d.isoformat() not in run_dates][:strength_days]
+
+        try:
+            from db.exercises import get_exercise_defaults
+            exercise_names = [d["name"] for d in get_exercise_defaults()]
+        except Exception:
+            exercise_names = []
+
+        if exercise_names and strength_slots:
+            groups: list[list[str]] = [[] for _ in strength_slots]
+            for idx, name in enumerate(exercise_names):
+                groups[idx % len(strength_slots)].append(name)
+
+            for i, slot_date in enumerate(strength_slots):
+                sessions.append({
+                    "date":                slot_date.isoformat(),
+                    "type":                "strength",
+                    "workout_name":        f"Strength — {phase} Wk{current_week} (Day {i + 1})",
+                    "description":         "Auto-generated from your tracked exercise defaults "
+                                            "(set_exercise_defaults). Adjust weights there, or override "
+                                            "a single session with create_strength_workout.",
+                    "planned_distance_km": None,
+                    "exercises":           [{"name": nm} for nm in groups[i]],
+                })
+        # else: no exercises on file yet — nothing sane to auto-program, so skip
+        # silently rather than fabricate a routine Kyle hasn't set defaults for.
+
     return sessions
 
 

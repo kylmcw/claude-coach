@@ -758,9 +758,11 @@ async def call_tool(name: str, arguments: dict):
             if s.get("error"):
                 lines.append(f"  {s['date']}  {s['workout_name']} — ERROR: {s['error']}")
             else:
+                km = s.get("planned_distance_km")
+                km_label = f"({km} km)" if km is not None else "(strength)"
                 lines.append(
                     f"  {s['date']}  {s['workout_name']}  "
-                    f"({s['planned_distance_km']} km)  ID: {s.get('garmin_workout_id')}"
+                    f"{km_label}  ID: {s.get('garmin_workout_id')}"
                 )
         lines.append("\nAll sessions have been scheduled on your Garmin Connect calendar.")
 
@@ -995,10 +997,41 @@ async def call_tool(name: str, arguments: dict):
                 )
             )]
 
+        pace_source = zones.get("_pace_source", "garmin_lt")
+        source_label = {
+            "manual": "manual override",
+            "laps":   "median of your threshold-HR laps",
+            "garmin_lt": "Garmin lactate threshold",
+        }.get(pace_source, pace_source)
+
         lines = [
             f"TRAINING ZONES — {date.today().strftime('%A %d %B %Y')}",
-            f"Source: Garmin lactate threshold",
+            f"LTHR source: Garmin lactate threshold   Pace source: {source_label}",
             f"LTHR: {lthr or 'N/A'} bpm   LT Pace: {fmt_pace(lt_pace)}",
+        ]
+
+        # Garmin's LT only re-detects during a hard enough effort, so it can sit stale
+        # for months. Say how old it is rather than presenting it as current fitness.
+        measured_on = zones.get("_measured_on")
+        if measured_on:
+            try:
+                age = (date.today() - date.fromisoformat(measured_on)).days
+                note = f"Garmin LT detected {measured_on} ({age}d ago)"
+                if age > 60:
+                    note += " — stale; run a progressive hard effort to refresh"
+                lines.append(note)
+            except ValueError:
+                pass
+
+        if pace_source == "laps":
+            garmin_pace = zones.get("_garmin_pace_sec")
+            if garmin_pace and lt_pace and abs(garmin_pace - lt_pace) > 20:
+                lines.append(
+                    f"Garmin's stored LT pace was {fmt_pace(garmin_pace)} — "
+                    f"overridden, your laps at threshold HR say {fmt_pace(lt_pace)}"
+                )
+
+        lines += [
             "",
             f"{'Zone':<12} {'HR Range':<20} {'Pace Range':<25} Notes",
             "─" * 72,

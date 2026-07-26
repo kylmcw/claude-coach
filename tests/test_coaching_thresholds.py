@@ -197,15 +197,35 @@ class TestGetZones:
     def test_get_zones_attaches_meta_keys(self, monkeypatch):
         """get_zones() must always attach _source, _lthr, _lt_pace_sec."""
         def fake_fetch():
-            return {"lthr": 165, "lt_pace_sec": 270, "source": "garmin_lt"}
+            return {"lthr": 165, "lt_pace_sec": 270,
+                    "measured_on": "2026-01-01", "source": "garmin_lt"}
 
         monkeypatch.setattr(thresholds, "fetch_lactate_threshold", fake_fetch)
+        # Stub the resolver: it reads the user's real calibration file otherwise.
+        monkeypatch.setattr(thresholds, "resolve_lt_pace", lambda lthr, pace: (pace, "garmin_lt"))
         zones = thresholds.get_zones()
         assert "_source" in zones
         assert "_lthr" in zones
         assert "_lt_pace_sec" in zones
         assert zones["_lthr"] == 165
         assert zones["_lt_pace_sec"] == 270
+
+    def test_get_zones_uses_resolved_pace_not_garmins(self, monkeypatch):
+        """The resolved pace builds the zones; Garmin's raw value is kept only for display."""
+        def fake_fetch():
+            return {"lthr": 183, "lt_pace_sec": 356,
+                    "measured_on": "2026-03-16", "source": "garmin_lt"}
+
+        monkeypatch.setattr(thresholds, "fetch_lactate_threshold", fake_fetch)
+        monkeypatch.setattr(thresholds, "resolve_lt_pace", lambda lthr, pace: (293, "laps"))
+        zones = thresholds.get_zones()
+
+        assert zones["_lt_pace_sec"] == 293
+        assert zones["_garmin_pace_sec"] == 356
+        assert zones["_pace_source"] == "laps"
+        assert zones["_measured_on"] == "2026-03-16"
+        # zones must be built off 293, not 356
+        assert zones["threshold"]["pace"] == (288, 303)
 
     def test_get_zones_unavailable_source(self, monkeypatch):
         def fake_fetch():
@@ -217,3 +237,91 @@ class TestGetZones:
         for z in ("easy", "aerobic", "threshold", "interval"):
             assert zones[z]["hr"] is None
             assert zones[z]["pace"] is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# median_threshold_pace — lap-derived LT anchor
+# ─────────────────────────────────────────────────────────────────────────────
+
+LTHR = 183          # band = 170.2 – 188.5 bpm
+
+# Real laps from the 2026-07-07 / 07-20 / 07-26 tempo sessions.
+REAL_LAPS = [
+    (1000, 291.5, 179), (1000, 293.3, 181), (1000, 296.0, 171),   # 07-07  4:51–4:56
+    (1000, 287.5, 173), (1000, 300.7, 174), (1000, 302.1, 171),   # 07-20  4:47–5:02
+    (1000, 314.4, 175), (1000, 322.4, 173),                       # 07-26  5:14–5:22
+]
+
+
+class TestMedianThresholdPace:
+    def test_real_laps_land_near_five_min(self):
+        pace = thresholds.median_threshold_pace(REAL_LAPS, LTHR)
+        assert pace is not None
+        assert 285 <= pace <= 305, f"expected ~4:50–5:05/km, got {pace}s"
+
+    def test_rejects_short_recovery_laps(self):
+        """HR lags effort, so a 200m jog after a rep carries the rep's HR at jog pace.
+        Left in, it drags the median minutes slow."""
+        noisy = REAL_LAPS + [(200, 700.8, 172), (200, 1133.8, 175)]
+        assert (thresholds.median_threshold_pace(noisy, LTHR)
+                == thresholds.median_threshold_pace(REAL_LAPS, LTHR))
+
+    def test_rejects_short_vo2_reps(self):
+        """800m reps at 3:53–4:16/km sit inside the threshold HR band but are VO2 work.
+        Left in, they drag the anchor fast and every prescribed tempo pace with it."""
+        noisy = REAL_LAPS + [(800, 233.6, 182), (800, 256.1, 178), (800, 275.8, 177)]
+        assert (thresholds.median_threshold_pace(noisy, LTHR)
+                == thresholds.median_threshold_pace(REAL_LAPS, LTHR))
+
+    def test_excludes_out_of_band_hr(self):
+        noisy = REAL_LAPS + [(1000, 380.0, 145), (1000, 370.0, 152), (1000, 240.0, 195)]
+        assert (thresholds.median_threshold_pace(noisy, LTHR)
+                == thresholds.median_threshold_pace(REAL_LAPS, LTHR))
+
+    def test_returns_none_below_min_samples(self):
+        assert thresholds.median_threshold_pace(REAL_LAPS[:4], LTHR) is None
+
+    def test_returns_none_without_lthr(self):
+        assert thresholds.median_threshold_pace(REAL_LAPS, None) is None
+
+    def test_median_resists_one_bad_lap(self):
+        """One mis-tagged lap must not move the anchor — this is why it's a median."""
+        baseline = thresholds.median_threshold_pace(REAL_LAPS, LTHR)
+        skewed = thresholds.median_threshold_pace(REAL_LAPS + [(1000, 200.0, 180)], LTHR)
+        assert baseline is not None and skewed is not None
+        assert abs(skewed - baseline) <= 5
+
+
+class TestResolveLtPace:
+    def test_manual_override_wins(self, monkeypatch):
+        monkeypatch.setattr(thresholds, "read_state", lambda: {"lt_pace_sec": 295})
+        assert thresholds.resolve_lt_pace(183, 356) == (295, "manual")
+
+    def test_fresh_cache_used_without_refetch(self, monkeypatch):
+        from datetime import date
+        monkeypatch.setattr(thresholds, "read_state", lambda: {
+            "lt_pace_derived": 293, "lt_pace_derived_on": date.today().isoformat()})
+        monkeypatch.setattr(thresholds, "fetch_threshold_laps",
+                            lambda *a, **k: pytest.fail("should not refetch on fresh cache"))
+        assert thresholds.resolve_lt_pace(183, 356) == (293, "laps")
+
+    def test_stale_cache_triggers_rederive(self, monkeypatch):
+        monkeypatch.setattr(thresholds, "read_state", lambda: {
+            "lt_pace_derived": 999, "lt_pace_derived_on": "2020-01-01"})
+        monkeypatch.setattr(thresholds, "fetch_threshold_laps", lambda *a, **k: REAL_LAPS)
+        monkeypatch.setattr(thresholds, "update_state", lambda **kw: None)
+        pace, source = thresholds.resolve_lt_pace(183, 356)
+        assert source == "laps" and pace != 999
+
+    def test_falls_back_to_garmin_when_laps_insufficient(self, monkeypatch):
+        monkeypatch.setattr(thresholds, "read_state", lambda: {})
+        monkeypatch.setattr(thresholds, "fetch_threshold_laps", lambda *a, **k: REAL_LAPS[:2])
+        assert thresholds.resolve_lt_pace(183, 356) == (356, "garmin_lt")
+
+    def test_falls_back_to_garmin_when_fetch_raises(self, monkeypatch):
+        """A Garmin outage must degrade to the stored value, not blow up get_zones."""
+        def boom(*a, **k):
+            raise RuntimeError("garmin down")
+        monkeypatch.setattr(thresholds, "read_state", lambda: {})
+        monkeypatch.setattr(thresholds, "fetch_threshold_laps", boom)
+        assert thresholds.resolve_lt_pace(183, 356) == (356, "garmin_lt")
