@@ -81,18 +81,23 @@ def fetch_threshold_laps(
     """
     Pull (distance_m, pace_sec_per_km, avg_hr) for every lap of recent runs.
 
-    ponytail: one splits call per activity, sequential. ~40 calls on a cold cache;
-    fine because resolve_lt_pace only re-derives weekly. Parallelise if it ever
-    lands in an interactive path.
+    The window is whichever binds first: lookback_days, or activity_limit as a
+    hard cap on how much history a single derivation will walk.
+
+    ponytail: one splits call per activity, sequential. ~40 calls worst case on a
+    cold cache; fine because resolve_lt_pace only re-derives weekly. Parallelise if
+    it ever lands in an interactive path.
     """
     client = get_client()
     cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
     laps: list[tuple[float, float, float]] = []
 
     for act in client.get_activities(0, activity_limit):
-        if "running" not in (act.get("activityType") or {}).get("typeKey", ""):
-            continue
+        # Garmin returns newest-first, so the first activity past the cutoff ends
+        # the walk — no point paying a splits call for everything older.
         if (act.get("startTimeLocal") or "")[:10] < cutoff:
+            break
+        if "running" not in (act.get("activityType") or {}).get("typeKey", ""):
             continue
         try:
             splits = client.get_activity_splits(act["activityId"]).get("lapDTOs", [])
@@ -106,6 +111,41 @@ def fetch_threshold_laps(
                 laps.append((dist, 1000 / speed, hr))
 
     return laps
+
+
+def parse_pace(value) -> int | None:
+    """
+    Coerce a calibration-file pace to sec/km. Accepts a number, or "M:SS".
+
+    That file is hand-edited, so "4:55" is at least as likely as 295. Returns None
+    for anything unparseable rather than raising: a typo in a config file must not
+    take down every zone-consuming tool.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) if value > 0 else None
+
+    text = str(value).strip()
+    try:
+        if ":" in text:
+            minutes, seconds = text.split(":", 1)
+            total = int(minutes) * 60 + int(seconds)
+        else:
+            total = int(float(text))
+    except ValueError:
+        return None
+    return total if total > 0 else None
+
+
+def _stamp_is_fresh(stamp: str | None) -> bool:
+    """True if an ISO date stamp falls inside the re-derive window."""
+    if not stamp:
+        return False
+    try:
+        return (date.today() - date.fromisoformat(stamp)).days < LT_REDERIVE_AFTER_DAYS
+    except ValueError:
+        return False  # corrupt stamp → treat as expired
 
 
 def resolve_lt_pace(lthr: int | None, garmin_pace: int | None) -> tuple[int | None, str]:
@@ -122,17 +162,19 @@ def resolve_lt_pace(lthr: int | None, garmin_pace: int | None) -> tuple[int | No
     """
     state = read_state()
 
-    manual = state.get("lt_pace_sec")
+    manual = parse_pace(state.get("lt_pace_sec"))
     if manual:
-        return int(manual), "manual"
+        return manual, "manual"
 
-    cached, cached_on = state.get("lt_pace_derived"), state.get("lt_pace_derived_on")
-    if cached and cached_on:
-        try:
-            if (date.today() - date.fromisoformat(cached_on)).days < LT_REDERIVE_AFTER_DAYS:
-                return int(cached), "laps"
-        except ValueError:
-            pass  # corrupt cache date → re-derive
+    cached = parse_pace(state.get("lt_pace_derived"))
+    if cached and _stamp_is_fresh(state.get("lt_pace_derived_on")):
+        return cached, "laps"
+
+    # Failed derivations are cached too. Without this, a taper or injury block
+    # (fewer than LT_LAP_MIN_SAMPLES qualifying laps) re-runs the full ~40-call
+    # activity scan on every get_zones and discards the result every time.
+    if _stamp_is_fresh(state.get("lt_pace_derive_failed_on")):
+        return garmin_pace, "garmin_lt"
 
     try:
         derived = median_threshold_pace(fetch_threshold_laps(), lthr)
@@ -141,9 +183,11 @@ def resolve_lt_pace(lthr: int | None, garmin_pace: int | None) -> tuple[int | No
 
     if derived:
         update_state(lt_pace_derived=derived,
-                     lt_pace_derived_on=date.today().isoformat())
+                     lt_pace_derived_on=date.today().isoformat(),
+                     lt_pace_derive_failed_on=None)
         return derived, "laps"
 
+    update_state(lt_pace_derive_failed_on=date.today().isoformat())
     return garmin_pace, "garmin_lt"
 
 
@@ -194,7 +238,8 @@ def derive_zones(lthr: int | None, lt_pace_sec: int | None) -> dict:
 def get_zones() -> dict:
     """
     Top-level helper: fetch LT from Garmin then derive all pace/HR zones.
-    Attaches _source, _lthr, _lt_pace_sec for caller transparency.
+    Attaches _lt_source (did Garmin have LT data at all) and _pace_source (where the
+    pace actually came from) — two different questions, kept as two keys.
     """
     lt = fetch_lactate_threshold()
 
@@ -207,7 +252,7 @@ def get_zones() -> dict:
         lt_pace, pace_source = resolve_lt_pace(lt.get("lthr"), lt.get("lt_pace_sec"))
 
     zones = derive_zones(lt.get("lthr"), lt_pace)
-    zones["_source"]          = lt["source"]
+    zones["_lt_source"]       = lt["source"]
     zones["_lthr"]            = lt.get("lthr")
     zones["_lt_pace_sec"]     = lt_pace
     zones["_pace_source"]     = pace_source

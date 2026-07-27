@@ -975,7 +975,7 @@ async def call_tool(name: str, arguments: dict):
 
     elif name == "get_zones":
         zones = get_zones()
-        source   = zones.get("_source", "unavailable")
+        source   = zones.get("_lt_source", "unavailable")
         lthr     = zones.get("_lthr")
         lt_pace  = zones.get("_lt_pace_sec")
 

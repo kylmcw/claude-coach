@@ -195,7 +195,7 @@ class TestEasyHrCeiling:
 
 class TestGetZones:
     def test_get_zones_attaches_meta_keys(self, monkeypatch):
-        """get_zones() must always attach _source, _lthr, _lt_pace_sec."""
+        """get_zones() must always attach _lt_source, _lthr, _lt_pace_sec."""
         def fake_fetch():
             return {"lthr": 165, "lt_pace_sec": 270,
                     "measured_on": "2026-01-01", "source": "garmin_lt"}
@@ -204,7 +204,7 @@ class TestGetZones:
         # Stub the resolver: it reads the user's real calibration file otherwise.
         monkeypatch.setattr(thresholds, "resolve_lt_pace", lambda lthr, pace: (pace, "garmin_lt"))
         zones = thresholds.get_zones()
-        assert "_source" in zones
+        assert "_lt_source" in zones
         assert "_lthr" in zones
         assert "_lt_pace_sec" in zones
         assert zones["_lthr"] == 165
@@ -233,7 +233,7 @@ class TestGetZones:
 
         monkeypatch.setattr(thresholds, "fetch_lactate_threshold", fake_fetch)
         zones = thresholds.get_zones()
-        assert zones["_source"] == "unavailable"
+        assert zones["_lt_source"] == "unavailable"
         for z in ("easy", "aerobic", "threshold", "interval"):
             assert zones[z]["hr"] is None
             assert zones[z]["pace"] is None
@@ -325,3 +325,102 @@ class TestResolveLtPace:
         monkeypatch.setattr(thresholds, "read_state", lambda: {})
         monkeypatch.setattr(thresholds, "fetch_threshold_laps", boom)
         assert thresholds.resolve_lt_pace(183, 356) == (356, "garmin_lt")
+
+
+class TestParsePace:
+    """The calibration file is hand-edited, so a typo must degrade, never raise."""
+
+    def test_accepts_seconds_int(self):
+        assert thresholds.parse_pace(295) == 295
+
+    def test_accepts_m_ss_string(self):
+        assert thresholds.parse_pace("4:55") == 295
+
+    def test_accepts_numeric_string(self):
+        assert thresholds.parse_pace("295") == 295
+
+    @pytest.mark.parametrize("bad", ["", "abc", "4:xx", None, True, -10, 0, "  "])
+    def test_returns_none_never_raises(self, bad):
+        assert thresholds.parse_pace(bad) is None
+
+    def test_malformed_override_does_not_break_resolution(self, monkeypatch):
+        """Regression: int("4:55") used to raise straight out of get_zones."""
+        monkeypatch.setattr(thresholds, "read_state", lambda: {"lt_pace_sec": "nonsense"})
+        monkeypatch.setattr(thresholds, "fetch_threshold_laps", lambda *a, **k: [])
+        monkeypatch.setattr(thresholds, "update_state", lambda **kw: None)
+        assert thresholds.resolve_lt_pace(183, 356) == (356, "garmin_lt")
+
+
+class TestFailedDerivationCaching:
+    def test_failure_is_cached(self, monkeypatch):
+        """Regression: a thin training block re-ran the full activity scan every call."""
+        from datetime import date
+        written = {}
+        monkeypatch.setattr(thresholds, "read_state", lambda: {})
+        monkeypatch.setattr(thresholds, "fetch_threshold_laps", lambda *a, **k: [])
+        monkeypatch.setattr(thresholds, "update_state", lambda **kw: written.update(kw))
+
+        assert thresholds.resolve_lt_pace(183, 356) == (356, "garmin_lt")
+        assert written["lt_pace_derive_failed_on"] == date.today().isoformat()
+
+    def test_recent_failure_skips_refetch(self, monkeypatch):
+        from datetime import date
+        monkeypatch.setattr(thresholds, "read_state", lambda: {
+            "lt_pace_derive_failed_on": date.today().isoformat()})
+        monkeypatch.setattr(thresholds, "fetch_threshold_laps",
+                            lambda *a, **k: pytest.fail("should not refetch after recent failure"))
+        assert thresholds.resolve_lt_pace(183, 356) == (356, "garmin_lt")
+
+    def test_old_failure_allows_retry(self, monkeypatch):
+        monkeypatch.setattr(thresholds, "read_state", lambda: {
+            "lt_pace_derive_failed_on": "2020-01-01"})
+        monkeypatch.setattr(thresholds, "fetch_threshold_laps", lambda *a, **k: REAL_LAPS)
+        monkeypatch.setattr(thresholds, "update_state", lambda **kw: None)
+        pace, source = thresholds.resolve_lt_pace(183, 356)
+        assert source == "laps"
+
+    def test_success_clears_failure_marker(self, monkeypatch):
+        written = {}
+        monkeypatch.setattr(thresholds, "read_state", lambda: {
+            "lt_pace_derive_failed_on": "2020-01-01"})
+        monkeypatch.setattr(thresholds, "fetch_threshold_laps", lambda *a, **k: REAL_LAPS)
+        monkeypatch.setattr(thresholds, "update_state", lambda **kw: written.update(kw))
+        thresholds.resolve_lt_pace(183, 356)
+        assert written["lt_pace_derive_failed_on"] is None
+
+    def test_corrupt_stamp_treated_as_expired(self, monkeypatch):
+        monkeypatch.setattr(thresholds, "read_state", lambda: {
+            "lt_pace_derived": 293, "lt_pace_derived_on": "not-a-date"})
+        monkeypatch.setattr(thresholds, "fetch_threshold_laps", lambda *a, **k: REAL_LAPS)
+        monkeypatch.setattr(thresholds, "update_state", lambda **kw: None)
+        pace, source = thresholds.resolve_lt_pace(183, 356)
+        assert source == "laps" and pace != 293
+
+
+class TestFetchThresholdLapsWindow:
+    def test_stops_at_cutoff_without_paying_for_older_activities(self, monkeypatch):
+        """Garmin returns newest-first: the walk must stop, not scan to the limit."""
+        from datetime import date, timedelta
+        recent = (date.today() - timedelta(days=2)).isoformat()
+        old    = (date.today() - timedelta(days=400)).isoformat()
+        splits_calls = []
+
+        class FakeClient:
+            def get_activities(self, start, limit):
+                return [
+                    {"activityId": 1, "startTimeLocal": f"{recent} 08:00:00",
+                     "activityType": {"typeKey": "running"}},
+                    {"activityId": 2, "startTimeLocal": f"{old} 08:00:00",
+                     "activityType": {"typeKey": "running"}},
+                    {"activityId": 3, "startTimeLocal": f"{old} 08:00:00",
+                     "activityType": {"typeKey": "running"}},
+                ]
+
+            def get_activity_splits(self, aid):
+                splits_calls.append(aid)
+                return {"lapDTOs": [{"averageSpeed": 3.4, "averageHR": 175, "distance": 1000}]}
+
+        monkeypatch.setattr(thresholds, "get_client", lambda: FakeClient())
+        laps = thresholds.fetch_threshold_laps()
+        assert splits_calls == [1], f"walked past the cutoff: {splits_calls}"
+        assert len(laps) == 1
